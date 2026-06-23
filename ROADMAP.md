@@ -196,7 +196,7 @@ These need resolving as their phase approaches:
 - [x] Stack chosen (Python + PySide6)
 - [x] Architecture and structure defined
 - [x] Async approach decided (qasync)
-- [ ] Phase 0 — Foundation
+- [x] Phase 0 — Foundation
 - [ ] Phase 1 — Local data scaffold
 - [ ] Phase 2 — Microsoft authentication
 - [ ] Phase 3 — Outlook data
