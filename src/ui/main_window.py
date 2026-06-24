@@ -10,12 +10,12 @@ from PySide6.QtWidgets import QLabel, QMainWindow
 from config import APP_NAME
 
 
+from ui.views.outlook_view import OutlookView
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle(APP_NAME)
         self.resize(960, 640)
-
-        placeholder = QLabel("HighlandX — Phase 0: blank window is running.")
-        placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setCentralWidget(placeholder)
+        self.setCentralWidget(OutlookView())   # was the placeholder QLabel
