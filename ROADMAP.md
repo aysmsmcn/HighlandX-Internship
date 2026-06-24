@@ -165,6 +165,35 @@ Bundle with PyInstaller, test the standalone build on a clean machine.
 
 ---
 
+## Backlog / Potential Improvements
+
+Deferred enhancements — nice-to-haves, not blockers. Revisit during Phase 5
+(polish) or later.
+
+- **Auth hang on cancelled sign-in (bug):** If the Microsoft sign-in browser tab
+  is opened and then closed *without* signing in, the app freezes.
+  `InteractiveBrowserCredential.get_token()` runs synchronously and blocks the
+  Qt/qasync event loop until its ~300s timeout. Fix: run the blocking token call
+  off the loop (thread executor) and/or shorten the timeout and handle the
+  cancellation gracefully.
+- **Inbox rendering fidelity (Phase 3 enhancement):** The reading pane currently
+  uses `QTextBrowser`, which renders only a subset of HTML/CSS, so rich Outlook
+  emails look rough. Potential upgrades, in increasing effort:
+  1. Swap the reading pane to `QWebEngineView` (Chromium) for faithful HTML/CSS
+     rendering. Already available via `PySide6-Addons` — but bundling QtWebEngine
+     makes the Phase 6 PyInstaller build significantly larger/fiddlier.
+  2. **File attachments:** fetch via `/me/messages/{id}/attachments` and show a
+     list with open/save (attachments aren't returned with the body by default).
+  3. **Inline images:** rewrite `cid:` references to embedded data URIs so bodies
+     render completely.
+- **Outlook-style message list:** richer rows (sender bold + subject + grey
+  preview snippet + right-aligned date) via a custom row widget or
+  `QStyledItemDelegate`, instead of the current two-line list item.
+- **Proper paging/ordering:** use Graph query params (`$top`, `$orderby`,
+  `$select`) instead of slicing the default page client-side.
+
+---
+
 ## Open Decisions / Prerequisites
 
 These need resolving as their phase approaches:
@@ -197,10 +226,10 @@ These need resolving as their phase approaches:
 - [x] Architecture and structure defined
 - [x] Async approach decided (qasync)
 - [x] Phase 0 — Foundation
-- [ ] Phase 1 — Local data scaffold
-- [ ] Phase 2 — Microsoft authentication
-- [ ] Phase 3 — Outlook data
-- [ ] Phase 4 — Web automation
+- [x] Phase 1 — Local data scaffold
+- [x] Phase 2 — Microsoft authentication
+- [x] Phase 3 — Outlook data
+- [x] Phase 4 — External data (Affinity API; pivoted from web scraping to a company-centric view: 3-category browser, calendar Events, per-company relationship summary/timeline/notes, website + Affinity links)
 - [ ] Phase 5 — Integration & polish
 - [ ] Phase 6 — Packaging
 
