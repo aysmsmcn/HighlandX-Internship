@@ -11,6 +11,7 @@ from pathlib import Path
 # Allow `from ui...`, `from services...` etc. when running this file directly.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication
 from qasync import QEventLoop
 
@@ -18,7 +19,13 @@ from ui.main_window import MainWindow
 
 
 def main() -> None:
+    # Required before QApplication for the embedded QtWebEngine (PitchBook panel).
+    QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts)
+
     app = QApplication(sys.argv)
+    # Stable identity so the embedded web profile (saved logins) persists across launches.
+    app.setApplicationName("HighlandX")
+    app.setOrganizationName("HighlandX")
 
     loop = QEventLoop(app)
     asyncio.set_event_loop(loop)

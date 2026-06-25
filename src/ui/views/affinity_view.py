@@ -1,15 +1,25 @@
 import re
+from urllib.parse import quote_plus
 
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QPushButton, QListWidget,
-                               QLabel, QSplitter, QTextBrowser, QLineEdit)
+                               QLabel, QSplitter, QTextBrowser, QLineEdit, QComboBox)
 from PySide6.QtCore import Qt, QUrl
-from PySide6.QtGui import QDesktopServices
+from PySide6.QtWebEngineWidgets import QWebEngineView
+from PySide6.QtWebEngineCore import QWebEngineProfile, QWebEnginePage
 from qasync import asyncSlot
 
 from services.affinity_service import (my_owner_id, list_my_companies, Company,
                                        company_url, get_company_notes, Note,
                                        get_company_summary, Interaction)
 from services.outlook_service import get_calendar_events, get_message_by_subject
+
+# Best-guess PitchBook search URL. If it doesn't land on a search, do a search in
+# the panel, copy the address-bar URL, and replace this template ({q} = query).
+PITCHBOOK_SEARCH_URL = "https://my.pitchbook.com/search-results/s/all?query={q}"
+PITCHBOOK_HOME_URL = "https://my.pitchbook.com"
+# Raylu company URLs are internally generated (not name-based) → no pre-search;
+# just open the app and let the user navigate/search inside the panel.
+RAYLU_HOME_URL = "https://app.raylu.ai/"
 
 
 def _plain(text: str) -> str:
@@ -38,9 +48,11 @@ class AffinityView(QWidget):
         super().__init__()
         self._companies: list[Company] = []      # full loaded set
         self._current: Company | None = None
+        self._web_source: str | None = None      # last web panel source (for auto-refresh)
         self._notes: list[Note] = []
         self._timeline: list[tuple[str, Interaction]] = []   # (label, interaction)
-        self._reminders: list[dict] = []          # {company, date, subject}
+        self._events: list[dict] = []             # calendar events {company, date, subject}
+        self._reminders: list[Company] = []       # recently-added, not-contacted (Missed)
         self._ongoing: list[Company] = []         # emailed + met
         self._followup: list[Company] = []        # emailed, not met
         self._missed: list[Company] = []          # untouched
@@ -48,7 +60,13 @@ class AffinityView(QWidget):
         self.refresh_btn = QPushButton("Load my companies")
         self.status = QLabel("Click to load your Affinity companies.")
 
-        # --- events pane (top area) ---
+        # --- events pane (top-left) ---
+        self.events_status = QLabel("")
+        self.events_list = QListWidget()
+
+        # --- reminders pane (top-right): recently added, not contacted ---
+        self.reminders_order = QComboBox()
+        self.reminders_order.addItems(["Newest first", "Oldest first"])
         self.reminders_status = QLabel("")
         self.reminders_list = QListWidget()
 
@@ -72,15 +90,20 @@ class AffinityView(QWidget):
         # --- detail pane ---
         self.detail_name = QLabel("Select a company")
         self.detail_meta = QLabel("")
+        self.pitchbook_btn = QPushButton("Open in PitchBook")
+        self.raylu_btn = QPushButton("Open in Raylu")
         self.website_btn = QPushButton("Open website")
         self.affinity_btn = QPushButton("Open in Affinity")
         self.activity_btn = QPushButton("Load Activity")
-        for b in (self.website_btn, self.affinity_btn, self.activity_btn):
+        for b in (self.pitchbook_btn, self.raylu_btn, self.website_btn,
+                  self.affinity_btn, self.activity_btn):
             b.setEnabled(False)
         detail = QWidget()
         dl = QVBoxLayout(detail)
         dl.addWidget(self.detail_name)
         dl.addWidget(self.detail_meta)
+        dl.addWidget(self.pitchbook_btn)
+        dl.addWidget(self.raylu_btn)
         dl.addWidget(self.website_btn)
         dl.addWidget(self.affinity_btn)
         dl.addWidget(self.activity_btn)
@@ -118,24 +141,60 @@ class AffinityView(QWidget):
         columns.setStretchFactor(0, 2)
         columns.setStretchFactor(2, 2)
 
-        # --- events on top, columns below ---
+        # --- top row: events (left) + reminders (right) ---
+        top = QSplitter(Qt.Orientation.Horizontal)
+        top.addWidget(_titled("Events (upcoming)", self.events_status, self.events_list))
+        top.addWidget(_titled("Reminders — recently added, not contacted",
+                              self.reminders_order, self.reminders_status, self.reminders_list))
+
         main_split = QSplitter(Qt.Orientation.Vertical)
-        main_split.addWidget(_titled("Events (upcoming)",
-                                     self.reminders_status, self.reminders_list))
+        main_split.addWidget(top)
         main_split.addWidget(columns)
         main_split.setStretchFactor(1, 3)
 
+        # everything built so far is the "content" (compresses left when the web panel opens)
+        content = QWidget()
+        cv = QVBoxLayout(content)
+        cv.setContentsMargins(0, 0, 0, 0)
+        cv.addWidget(self.refresh_btn)
+        cv.addWidget(self.status)
+        cv.addWidget(main_split)
+
+        # --- shared web panel (right side, hidden until requested) ---
+        # One persistent profile holds logins for PitchBook, Raylu, Affinity web.
+        self._web_profile = QWebEngineProfile("highlandx-web", self)   # named → logins persist
+        self._web_profile.setPersistentCookiesPolicy(
+            QWebEngineProfile.PersistentCookiesPolicy.ForcePersistentCookies)
+        self.web_view = QWebEngineView()
+        self.web_view.setPage(QWebEnginePage(self._web_profile, self.web_view))
+        web_close = QPushButton("✕ Close")
+        web_close.clicked.connect(self.hide_web_panel)
+        self.web_panel = QWidget()
+        pp = QVBoxLayout(self.web_panel)
+        pp.setContentsMargins(0, 0, 0, 0)
+        pp.addWidget(web_close)
+        pp.addWidget(self.web_view)
+        self.web_panel.setVisible(False)
+
+        outer = QSplitter(Qt.Orientation.Horizontal)
+        outer.addWidget(content)
+        outer.addWidget(self.web_panel)
+        outer.setStretchFactor(0, 3)
+        outer.setStretchFactor(1, 2)
+
         layout = QVBoxLayout(self)
-        layout.addWidget(self.refresh_btn)
-        layout.addWidget(self.status)
-        layout.addWidget(main_split)
+        layout.addWidget(outer)
 
         self.refresh_btn.clicked.connect(self.load)
         self.search_box.textChanged.connect(self.apply_filter)
+        self.events_list.currentRowChanged.connect(self.select_from_event)
         self.reminders_list.currentRowChanged.connect(self.select_from_reminder)
+        self.reminders_order.currentIndexChanged.connect(lambda _i: self._build_reminders())
         self.ongoing_list.currentRowChanged.connect(lambda r: self._cat_selected("ongoing", r))
         self.followup_list.currentRowChanged.connect(lambda r: self._cat_selected("followup", r))
         self.missed_list.currentRowChanged.connect(lambda r: self._cat_selected("missed", r))
+        self.pitchbook_btn.clicked.connect(self.open_pitchbook)
+        self.raylu_btn.clicked.connect(self.open_raylu)
         self.website_btn.clicked.connect(self.open_website)
         self.affinity_btn.clicked.connect(self.open_affinity)
         self.activity_btn.clicked.connect(self.load_activity)
@@ -149,30 +208,31 @@ class AffinityView(QWidget):
         try:
             pid = await my_owner_id()
             self._companies = await list_my_companies(pid)
-            self.apply_filter()                 # partitions into the 3 columns + sets status
+            self.apply_filter()                 # partitions + builds reminders + sets status
         except Exception as err:
             self.status.setText(f"Failed: {err}")
             self.refresh_btn.setEnabled(True)
             return
 
-        await self._load_reminders()            # Outlook calendar — non-fatal
+        await self._load_events()               # Outlook calendar — non-fatal
         self.refresh_btn.setEnabled(True)
 
     def apply_filter(self) -> None:
-        """Filter by search term, then partition into Ongoing / Follow up / Missed."""
+        """Filter by search term, partition into the 3 columns, rebuild reminders."""
         term = self.search_box.text().strip().lower()
         visible = [c for c in self._companies if term in c.name.lower()]
         self._ongoing, self._followup, self._missed = [], [], []
         for c in visible:
-            if c.met:                           # met (and usually emailed) → ongoing
+            if c.met:
                 self._ongoing.append(c)
-            elif c.emailed:                     # emailed but not met → follow up
+            elif c.emailed:
                 self._followup.append(c)
-            else:                               # untouched → missed
+            else:
                 self._missed.append(c)
         self._fill(self.ongoing_list, self._ongoing)
         self._fill(self.followup_list, self._followup)
         self._fill(self.missed_list, self._missed)
+        self._build_reminders()
         self.status.setText(
             f"{len(self._companies)} companies — {len(self._ongoing)} ongoing, "
             f"{len(self._followup)} follow up, {len(self._missed)} missed"
@@ -186,6 +246,21 @@ class AffinityView(QWidget):
             widget.addItem(f"[{c.status}]  {c.name}")
         widget.setCurrentRow(-1)
         widget.blockSignals(False)
+
+    def _build_reminders(self) -> None:
+        """Recently-added, not-yet-contacted companies (the Missed set), sorted by date added."""
+        newest_first = self.reminders_order.currentIndex() == 0
+        self._reminders = sorted(self._missed, key=lambda c: c.added or "", reverse=newest_first)
+        self.reminders_list.blockSignals(True)
+        self.reminders_list.clear()
+        for c in self._reminders:
+            self.reminders_list.addItem(f"{_date(c.added)}  ·  {c.name}")
+        self.reminders_list.setCurrentRow(-1)
+        self.reminders_list.blockSignals(False)
+        self.reminders_status.setText(
+            f"{len(self._reminders)} recently added, not contacted"
+            if self._reminders else "None"
+        )
 
     def _cat_selected(self, cat: str, row: int) -> None:
         lst, companies = {
@@ -206,11 +281,20 @@ class AffinityView(QWidget):
         self._current = c
         self.detail_name.setText(f"<h2>{c.name}</h2>")
         self.detail_meta.setText(f"Status: {c.status or '—'}   ·   Domain: {c.domain or '—'}")
+        for b in (self.pitchbook_btn, self.raylu_btn, self.affinity_btn, self.activity_btn):
+            b.setEnabled(True)
         self.website_btn.setEnabled(bool(c.domain))
-        self.affinity_btn.setEnabled(True)
-        self.activity_btn.setEnabled(True)
 
-        # reset + hide the side view until they ask for this company
+        # if a panel is already open, refresh it for the new company instead of
+        # making the user re-click; otherwise just reset the (hidden) activity view
+        if self.side.isVisible():
+            self.load_activity()
+        else:
+            self._clear_activity()
+        if self.web_panel.isVisible():
+            self._reload_web()
+
+    def _clear_activity(self) -> None:
         self.side.setVisible(False)
         self._notes = []
         self._timeline = []
@@ -221,16 +305,21 @@ class AffinityView(QWidget):
         self.notes_status.clear()
         self.reader.clear()
 
+    def _select_and_highlight(self, company: Company) -> None:
+        """Select a company (as if searched) and highlight it in its category column."""
+        self.search_box.clear()                 # clears filter → repartitions all companies
+        self.select_company(company)
+        for lst, arr in [(self.ongoing_list, self._ongoing),
+                         (self.followup_list, self._followup),
+                         (self.missed_list, self._missed)]:
+            lst.blockSignals(True)
+            lst.setCurrentRow(arr.index(company) if company in arr else -1)
+            lst.blockSignals(False)
+
     # --- events (Outlook calendar) -----------------------------------------
 
     def _match_company(self, ev, domain_map: dict) -> Company | None:
-        """Identify the company an event is about, or None if not confident.
-
-        1. Primary: an attendee's email domain matches a company's domain
-           (so internal-only and other-investor meetings match nothing).
-        2. Fallback (events with no matching attendee): a *whole-word* company
-           name in the title, length >= 4, and only if exactly one matches.
-        """
+        """Identify the company an event is about, or None if not confident."""
         for addr in ev.attendees:
             domain = addr.rsplit("@", 1)[-1] if "@" in addr else ""
             if domain and domain in domain_map:
@@ -247,47 +336,82 @@ class AffinityView(QWidget):
                 seen.add(c.id)
                 hits.append(c)
                 if len(hits) > 1:
-                    return None          # ambiguous → don't guess
+                    return None
         return hits[0] if len(hits) == 1 else None
 
-    async def _load_reminders(self) -> None:
-        """Match upcoming calendar events to companies by name in title."""
-        self.reminders_list.clear()
-        self.reminders_status.setText("Loading events…")
+    async def _load_events(self) -> None:
+        """Match upcoming calendar events to companies (attendee domain, then title)."""
+        self.events_list.clear()
+        self.events_status.setText("Loading events…")
         try:
             events = await get_calendar_events()
         except Exception as err:
-            self.reminders_status.setText(f"Calendar load failed: {err}")
+            self.events_status.setText(f"Calendar load failed: {err}")
             return
 
         domain_map = {c.domain.lower(): c for c in self._companies if c.domain}
-        self._reminders = []
+        self._events = []
         for ev in events:
             company = self._match_company(ev, domain_map)
-            if company is None:          # can't confidently identify a company → skip it
+            if company is None:
                 continue
-            self._reminders.append({"company": company, "date": ev.start, "subject": ev.subject})
+            self._events.append({"company": company, "date": ev.start, "subject": ev.subject})
 
-        self._reminders.sort(key=lambda r: r["date"] or "")     # soonest first
-        for r in self._reminders:
-            self.reminders_list.addItem(f"{_date(r['date'])}  ·  {r['company'].name}  —  {r['subject']}")
-        self.reminders_status.setText(
-            f"{len(self._reminders)} events" if self._reminders else "No events matched to companies"
+        self._events.sort(key=lambda r: r["date"] or "")
+        for r in self._events:
+            self.events_list.addItem(f"{_date(r['date'])}  ·  {r['company'].name}  —  {r['subject']}")
+        self.events_status.setText(
+            f"{len(self._events)} events" if self._events else "No events matched to companies"
         )
 
+    def select_from_event(self, row: int) -> None:
+        if 0 <= row < len(self._events):
+            self._select_and_highlight(self._events[row]["company"])
+
     def select_from_reminder(self, row: int) -> None:
-        """Clicking an event selects that company as if searched."""
-        if not (0 <= row < len(self._reminders)):
+        if 0 <= row < len(self._reminders):
+            self._select_and_highlight(self._reminders[row])
+
+    # --- web panel (PitchBook / Raylu / website / Affinity) ----------------
+
+    def open_pitchbook(self) -> None:
+        """Reveal the web panel and search PitchBook for the current company (B; fallback A)."""
+        if not self._current:
             return
-        company = self._reminders[row]["company"]
-        self.search_box.clear()                 # clears filter → repartitions all companies
-        self.select_company(company)
-        for lst, arr in [(self.ongoing_list, self._ongoing),
-                         (self.followup_list, self._followup),
-                         (self.missed_list, self._missed)]:
-            lst.blockSignals(True)
-            lst.setCurrentRow(arr.index(company) if company in arr else -1)
-            lst.blockSignals(False)
+        self._web_source = "pitchbook"
+        self.web_panel.setVisible(True)
+        self.web_view.setUrl(QUrl(PITCHBOOK_SEARCH_URL.format(q=quote_plus(self._current.name))))
+
+    def open_raylu(self) -> None:
+        """Reveal the web panel and open Raylu (no name-based search → user navigates)."""
+        self._web_source = "raylu"
+        self.web_panel.setVisible(True)
+        self.web_view.setUrl(QUrl(RAYLU_HOME_URL))
+
+    def open_website(self) -> None:
+        if self._current and self._current.domain:
+            self._web_source = "website"
+            self.web_panel.setVisible(True)
+            self.web_view.setUrl(QUrl(f"https://{self._current.domain}"))
+
+    def open_affinity(self) -> None:
+        if self._current:
+            self._web_source = "affinity"
+            self.web_panel.setVisible(True)
+            self.web_view.setUrl(QUrl(company_url(self._current.id)))
+
+    def _reload_web(self) -> None:
+        """Re-point the open web panel at the current company (for company switches)."""
+        if self._web_source == "pitchbook":
+            self.open_pitchbook()
+        elif self._web_source == "website":
+            self.open_website()
+        elif self._web_source == "affinity":
+            self.open_affinity()
+        # raylu is not company-specific (URLs aren't name-based) → leave as-is
+
+    def hide_web_panel(self) -> None:
+        self.web_panel.setVisible(False)
 
     # --- activity (timeline + notes) ---------------------------------------
 
@@ -301,7 +425,6 @@ class AffinityView(QWidget):
 
         # --- relationship summary (firm-wide interaction dates) ---
         self.summary_label.setText("Loading…")
-        summary = None
         try:
             summary = await get_company_summary(c.id)
             self.summary_label.setText(
@@ -359,7 +482,6 @@ class AffinityView(QWidget):
             )
             return
 
-        # email — show metadata immediately, then attempt the body lookup
         meta = f"### {it.subject}\n\nFrom **{it.who}** · {_date(it.date)}\n\n"
         self.reader.setMarkdown(meta + "_Looking up the message in your mailbox…_")
         try:
@@ -383,11 +505,3 @@ class AffinityView(QWidget):
     def show_note(self, row: int) -> None:           # sync — renders selected note
         if 0 <= row < len(self._notes):
             self.reader.setMarkdown(self._notes[row].content or "")
-
-    def open_website(self) -> None:
-        if self._current and self._current.domain:
-            QDesktopServices.openUrl(QUrl(f"https://{self._current.domain}"))
-
-    def open_affinity(self) -> None:
-        if self._current:
-            QDesktopServices.openUrl(QUrl(company_url(self._current.id)))

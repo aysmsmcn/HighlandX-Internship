@@ -45,6 +45,7 @@ class Company:
     name: str
     domain: str | None        # join key for Outlook + PitchBook later
     status: str | None = None
+    added: str | None = None  # ISO date this company was added to the Deals list
     emailed: bool = False     # has a logged email (relationship intelligence)
     met: bool = False         # has a logged meeting/event
     first_email: Interaction | None = None
@@ -230,6 +231,7 @@ def _entity_to_company(entry: dict) -> Company:
     return Company(
         id=ent.get("id"), name=ent.get("name", ""), domain=domain,
         status=_status_text(entry),
+        added=entry.get("createdAt"),     # when added to the Deals list
         emailed=last_email is not None,
         met=last_event is not None,
         first_email=_interaction(entry, FIRST_EMAIL_FIELD_ID),
