@@ -8,8 +8,8 @@ from qasync import asyncSlot
 
 from services.affinity_service import (my_owner_id, list_my_companies, Company,
                                        company_url, get_company_notes, Note,
-                                       get_company_summary)
-from services.outlook_service import get_calendar_events
+                                       get_company_summary, Interaction)
+from services.outlook_service import get_calendar_events, get_message_by_subject
 
 
 def _plain(text: str) -> str:
@@ -39,6 +39,7 @@ class AffinityView(QWidget):
         self._companies: list[Company] = []      # full loaded set
         self._current: Company | None = None
         self._notes: list[Note] = []
+        self._timeline: list[tuple[str, Interaction]] = []   # (label, interaction)
         self._reminders: list[dict] = []          # {company, date, subject}
         self._ongoing: list[Company] = []         # emailed + met
         self._followup: list[Company] = []        # emailed, not met
@@ -138,6 +139,7 @@ class AffinityView(QWidget):
         self.website_btn.clicked.connect(self.open_website)
         self.affinity_btn.clicked.connect(self.open_affinity)
         self.activity_btn.clicked.connect(self.load_activity)
+        self.timeline_list.currentRowChanged.connect(self.show_timeline_entry)
         self.notes_list.currentRowChanged.connect(self.show_note)
 
     @asyncSlot()
@@ -211,6 +213,7 @@ class AffinityView(QWidget):
         # reset + hide the side view until they ask for this company
         self.side.setVisible(False)
         self._notes = []
+        self._timeline = []
         self.summary_label.clear()
         self.timeline_list.clear()
         self.timeline_status.clear()
@@ -219,6 +222,33 @@ class AffinityView(QWidget):
         self.reader.clear()
 
     # --- events (Outlook calendar) -----------------------------------------
+
+    def _match_company(self, ev, domain_map: dict) -> Company | None:
+        """Identify the company an event is about, or None if not confident.
+
+        1. Primary: an attendee's email domain matches a company's domain
+           (so internal-only and other-investor meetings match nothing).
+        2. Fallback (events with no matching attendee): a *whole-word* company
+           name in the title, length >= 4, and only if exactly one matches.
+        """
+        for addr in ev.attendees:
+            domain = addr.rsplit("@", 1)[-1] if "@" in addr else ""
+            if domain and domain in domain_map:
+                return domain_map[domain]
+
+        title = ev.subject.lower()
+        hits: list[Company] = []
+        seen: set = set()
+        for c in self._companies:
+            name = (c.name or "").lower().strip()
+            if len(name) < 4 or name not in title:
+                continue
+            if re.search(r"\b" + re.escape(name) + r"\b", title) and c.id not in seen:
+                seen.add(c.id)
+                hits.append(c)
+                if len(hits) > 1:
+                    return None          # ambiguous → don't guess
+        return hits[0] if len(hits) == 1 else None
 
     async def _load_reminders(self) -> None:
         """Match upcoming calendar events to companies by name in title."""
@@ -230,13 +260,13 @@ class AffinityView(QWidget):
             self.reminders_status.setText(f"Calendar load failed: {err}")
             return
 
+        domain_map = {c.domain.lower(): c for c in self._companies if c.domain}
         self._reminders = []
         for ev in events:
-            subj = ev.subject.lower()
-            for c in self._companies:
-                if c.name and c.name.lower() in subj:
-                    self._reminders.append({"company": c, "date": ev.start, "subject": ev.subject})
-                    break
+            company = self._match_company(ev, domain_map)
+            if company is None:          # can't confidently identify a company → skip it
+                continue
+            self._reminders.append({"company": company, "date": ev.start, "subject": ev.subject})
 
         self._reminders.sort(key=lambda r: r["date"] or "")     # soonest first
         for r in self._reminders:
@@ -283,22 +313,21 @@ class AffinityView(QWidget):
         except Exception as err:
             self.summary_label.setText(f"Summary failed: {err}")
 
-        # --- timeline: event anchors only, newest first ---
+        # --- timeline: rich interactions (emails + meetings) from Affinity ---
         self.timeline_list.clear()
-        anchors = []
-        if summary:
-            anchors = [
-                (summary.next_event, "Next meeting"),
-                (summary.last_event, "Last meeting"),
-                (summary.first_event, "First meeting"),
-                (summary.last_email, "Last email"),
-                (summary.first_email, "First email"),
-            ]
-            anchors = [(d, lbl) for d, lbl in anchors if d]
-            anchors.sort(key=lambda a: a[0], reverse=True)
-        for date, label in anchors:
-            self.timeline_list.addItem(f"{_date(date)}  ·  {label}")
-        self.timeline_status.setText(f"{len(anchors)} events" if anchors else "No timeline data")
+        self._timeline = []
+        for label, it in [("Next meeting", c.next_event), ("Last meeting", c.last_event),
+                          ("Last email", c.last_email), ("First email", c.first_email)]:
+            if it:
+                self._timeline.append((label, it))
+        self._timeline.sort(key=lambda t: t[1].date or "", reverse=True)   # newest first
+        for label, it in self._timeline:
+            icon = "✉" if it.kind == "email" else "📅"
+            self.timeline_list.addItem(f"{_date(it.date)}  ·  {icon} {it.subject}  —  {it.who}")
+        self.timeline_status.setText(
+            f"{len(self._timeline)} interactions — click to view"
+            if self._timeline else "No interactions"
+        )
 
         # --- notes (separate from the timeline) ---
         self.notes_list.clear()
@@ -317,6 +346,39 @@ class AffinityView(QWidget):
             self.notes_status.setText(f"Notes load failed: {err}")
         finally:
             self.activity_btn.setEnabled(True)
+
+    @asyncSlot()
+    async def show_timeline_entry(self, row: int) -> None:
+        """Render a timeline interaction; for emails, try to pull the body from Outlook."""
+        if not (0 <= row < len(self._timeline)):
+            return
+        label, it = self._timeline[row]
+        if it.kind == "meeting":
+            self.reader.setMarkdown(
+                f"### {it.subject}\n\n**{label}** · {_date(it.date)}\n\nAttendees: {it.who or '—'}"
+            )
+            return
+
+        # email — show metadata immediately, then attempt the body lookup
+        meta = f"### {it.subject}\n\nFrom **{it.who}** · {_date(it.date)}\n\n"
+        self.reader.setMarkdown(meta + "_Looking up the message in your mailbox…_")
+        try:
+            msg = await get_message_by_subject(it.subject)
+        except Exception as err:
+            self.reader.setMarkdown(meta + f"_Couldn't fetch body: {err}_")
+            return
+        if msg:
+            header = (f"<h3 style='margin:0'>{msg.subject}</h3>"
+                      f"<p style='color:#666;margin:4px 0'><b>{msg.sender_name}</b> "
+                      f"&lt;{msg.sender_address}&gt;<br>{msg.received}</p><hr>")
+            if msg.body_is_html:
+                self.reader.setHtml(header + msg.body_content)
+            else:
+                self.reader.setHtml(header + f"<pre style='white-space:pre-wrap'>{msg.body_content}</pre>")
+        else:
+            self.reader.setMarkdown(
+                meta + "_Not in your mailbox — body unavailable (you weren't a participant)._"
+            )
 
     def show_note(self, row: int) -> None:           # sync — renders selected note
         if 0 <= row < len(self._notes):

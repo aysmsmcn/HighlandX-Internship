@@ -22,11 +22,19 @@ class EmailSummary:
 @dataclass
 class CalendarEvent:
     subject: str
-    start: str            # ISO start datetime (string)
+    start: str                  # ISO start datetime (string)
+    attendees: list[str]        # lowercased email addresses (attendees + organizer)
+
+
+_graph_client: GraphServiceClient | None = None
 
 
 def _client() -> GraphServiceClient:
-    return GraphServiceClient(credentials=get_credential(), scopes=GRAPH_SCOPES)
+    """Shared Graph client — built once and reused so we authenticate once per session."""
+    global _graph_client
+    if _graph_client is None:
+        _graph_client = GraphServiceClient(credentials=get_credential(), scopes=GRAPH_SCOPES)
+    return _graph_client
 
 
 def _message_to_summary(m) -> EmailSummary:
@@ -72,6 +80,38 @@ async def get_messages_for_domain(domain: str, top: int = 15) -> list[EmailSumma
     return [_message_to_summary(m) for m in (page.value or [])]
 
 
+async def get_message_by_subject(subject: str) -> EmailSummary | None:
+    """Find a message in the signed-in mailbox by subject (for showing its body).
+
+    Returns None if no copy is in this mailbox (e.g. the user wasn't a
+    participant) — Graph can only read the signed-in user's own mailbox.
+    """
+    if not subject:
+        return None
+    from msgraph.generated.users.item.messages.messages_request_builder import (
+        MessagesRequestBuilder,
+    )
+
+    client = _client()
+    query = MessagesRequestBuilder.MessagesRequestBuilderGetQueryParameters(
+        search=f'"{subject}"', top=10,
+    )
+    config = MessagesRequestBuilder.MessagesRequestBuilderGetRequestConfiguration(
+        query_parameters=query,
+    )
+    page = await client.me.messages.get(request_configuration=config)
+    target = subject.strip().lower()
+    msgs = page.value or []
+    # exact subject first, then "contains" to tolerate Re:/Fwd: prefixes
+    for m in msgs:
+        if (m.subject or "").strip().lower() == target:
+            return _message_to_summary(m)
+    for m in msgs:
+        if target in (m.subject or "").strip().lower():
+            return _message_to_summary(m)
+    return None
+
+
 async def get_calendar_events(days_back: int = 0, days_ahead: int = 90) -> list[CalendarEvent]:
     """Calendar events from (now - days_back) to (now + days_ahead), via Graph
     calendarView. days_back=0 → from now onward. Surfaces upcoming events."""
@@ -91,7 +131,7 @@ async def get_calendar_events(days_back: int = 0, days_ahead: int = 90) -> list[
         end_date_time=end,
         top=250,
         orderby=["start/dateTime"],
-        select=["subject", "start"],
+        select=["subject", "start", "attendees", "organizer"],
     )
     config = CalendarViewRequestBuilder.CalendarViewRequestBuilderGetRequestConfiguration(
         query_parameters=query,
@@ -100,5 +140,11 @@ async def get_calendar_events(days_back: int = 0, days_ahead: int = 90) -> list[
     out = []
     for e in (page.value or []):
         start_dt = e.start.date_time if (e.start and e.start.date_time) else ""
-        out.append(CalendarEvent(subject=e.subject or "(no title)", start=start_dt))
+        addrs = []
+        for a in (e.attendees or []):
+            if a.email_address and a.email_address.address:
+                addrs.append(a.email_address.address.lower())
+        if e.organizer and e.organizer.email_address and e.organizer.email_address.address:
+            addrs.append(e.organizer.email_address.address.lower())
+        out.append(CalendarEvent(subject=e.subject or "(no title)", start=start_dt, attendees=addrs))
     return out

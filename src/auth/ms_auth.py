@@ -8,17 +8,24 @@ from azure.identity import InteractiveBrowserCredential, TokenCachePersistenceOp
 from config import MS_CLIENT_ID, MS_TENANT_ID
 
 
-def get_credential() -> InteractiveBrowserCredential:
-    """Return an interactive-browser credential with a persistent token cache.
+_credential: InteractiveBrowserCredential | None = None
 
-    The cache stores the refresh token in OS-native secure storage, so the user
-    is only prompted to sign in once; later launches reuse the cached login.
+
+def get_credential() -> InteractiveBrowserCredential:
+    """Return a shared interactive-browser credential with a persistent token cache.
+
+    Built once and reused for the app's lifetime, so the user signs in at most
+    once per session (the persistent cache stores the refresh token in OS-native
+    secure storage, so later launches reuse the login too).
     """
-    return InteractiveBrowserCredential(
-        tenant_id=MS_TENANT_ID,
-        client_id=MS_CLIENT_ID,
-        cache_persistence_options=TokenCachePersistenceOptions(name="highlandx"),
-    )
+    global _credential
+    if _credential is None:
+        _credential = InteractiveBrowserCredential(
+            tenant_id=MS_TENANT_ID,
+            client_id=MS_CLIENT_ID,
+            cache_persistence_options=TokenCachePersistenceOptions(name="highlandx"),
+        )
+    return _credential
 
 
 if __name__ == "__main__":
