@@ -128,6 +128,16 @@ async def get_company_notes(company_id: int) -> list[Note]:
     ]
 
 
+async def company_has_notes(company_id: int) -> bool:
+    """True if a company has at least one note (cheap — fetches a single note)."""
+    async with httpx.AsyncClient(base_url=AFFINITY_BASE, auth=_basic_auth(), timeout=30) as client:
+        resp = await client.get("/notes", params={"organization_id": company_id, "page_size": 1})
+        resp.raise_for_status()
+        data = resp.json()
+        notes = data if isinstance(data, list) else data.get("notes", [])
+        return len(notes) > 0
+
+
 async def get_company_summary(company_id: int) -> CompanySummary:
     """Firm-wide interaction summary dates for a company (v1 with_interaction_dates)."""
     async with httpx.AsyncClient(base_url=AFFINITY_BASE, auth=_basic_auth(), timeout=30) as client:

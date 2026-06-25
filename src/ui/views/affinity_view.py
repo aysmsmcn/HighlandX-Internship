@@ -1,3 +1,4 @@
+import asyncio
 import re
 from urllib.parse import quote_plus
 
@@ -10,7 +11,7 @@ from qasync import asyncSlot
 
 from services.affinity_service import (my_owner_id, list_my_companies, Company,
                                        company_url, get_company_notes, Note,
-                                       get_company_summary, Interaction)
+                                       get_company_summary, Interaction, company_has_notes)
 from services.outlook_service import get_calendar_events, get_message_by_subject
 
 # Best-guess PitchBook search URL. If it doesn't land on a search, do a search in
@@ -52,7 +53,8 @@ class AffinityView(QWidget):
         self._notes: list[Note] = []
         self._timeline: list[tuple[str, Interaction]] = []   # (label, interaction)
         self._events: list[dict] = []             # calendar events {company, date, subject}
-        self._reminders: list[Company] = []       # recently-added, not-contacted (Missed)
+        self._reminders: list[Company] = []       # noted, not-contacted (Missed + has notes)
+        self._noted_ids: set[int] = set()         # org ids that have at least one note
         self._ongoing: list[Company] = []         # emailed + met
         self._followup: list[Company] = []        # emailed, not met
         self._missed: list[Company] = []          # untouched
@@ -144,7 +146,7 @@ class AffinityView(QWidget):
         # --- top row: events (left) + reminders (right) ---
         top = QSplitter(Qt.Orientation.Horizontal)
         top.addWidget(_titled("Events (upcoming)", self.events_status, self.events_list))
-        top.addWidget(_titled("Reminders — recently added, not contacted",
+        top.addWidget(_titled("Reminders — noted, not contacted",
                               self.reminders_order, self.reminders_status, self.reminders_list))
 
         main_split = QSplitter(Qt.Orientation.Vertical)
@@ -208,6 +210,8 @@ class AffinityView(QWidget):
         try:
             pid = await my_owner_id()
             self._companies = await list_my_companies(pid)
+            self.status.setText("Checking notes on untouched companies…")
+            await self._index_noted_missed()
             self.apply_filter()                 # partitions + builds reminders + sets status
         except Exception as err:
             self.status.setText(f"Failed: {err}")
@@ -248,9 +252,10 @@ class AffinityView(QWidget):
         widget.blockSignals(False)
 
     def _build_reminders(self) -> None:
-        """Recently-added, not-yet-contacted companies (the Missed set), sorted by date added."""
+        """Noted-but-not-contacted companies (Missed set that have notes), sorted by date added."""
         newest_first = self.reminders_order.currentIndex() == 0
-        self._reminders = sorted(self._missed, key=lambda c: c.added or "", reverse=newest_first)
+        noted = [c for c in self._missed if c.id in self._noted_ids]
+        self._reminders = sorted(noted, key=lambda c: c.added or "", reverse=newest_first)
         self.reminders_list.blockSignals(True)
         self.reminders_list.clear()
         for c in self._reminders:
@@ -258,9 +263,23 @@ class AffinityView(QWidget):
         self.reminders_list.setCurrentRow(-1)
         self.reminders_list.blockSignals(False)
         self.reminders_status.setText(
-            f"{len(self._reminders)} recently added, not contacted"
-            if self._reminders else "None"
+            f"{len(self._reminders)} noted, not contacted" if self._reminders else "None"
         )
+
+    async def _index_noted_missed(self) -> None:
+        """Check only the untouched (Missed) companies for notes → _noted_ids."""
+        untouched = [c for c in self._companies if not c.emailed and not c.met]
+        sem = asyncio.Semaphore(10)            # bound concurrency to be kind to the API
+
+        async def check(c: Company) -> int | None:
+            async with sem:
+                try:
+                    return c.id if await company_has_notes(c.id) else None
+                except Exception:
+                    return None
+
+        results = await asyncio.gather(*(check(c) for c in untouched))
+        self._noted_ids = {cid for cid in results if cid is not None}
 
     def _cat_selected(self, cat: str, row: int) -> None:
         lst, companies = {
