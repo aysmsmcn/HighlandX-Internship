@@ -2,7 +2,7 @@ from dataclasses import dataclass
 
 from msgraph import GraphServiceClient
 
-from auth.ms_auth import get_credential
+from auth.ms_auth import get_credential, ensure_authenticated
 from config import GRAPH_SCOPES
 
 
@@ -92,6 +92,7 @@ async def get_message_by_subject(subject: str) -> EmailSummary | None:
         MessagesRequestBuilder,
     )
 
+    await ensure_authenticated()                 # sign in off-loop if needed
     client = _client()
     query = MessagesRequestBuilder.MessagesRequestBuilderGetQueryParameters(
         search=f'"{subject}"', top=10,
@@ -125,6 +126,7 @@ async def get_calendar_events(days_back: int = 0, days_ahead: int = 90) -> list[
     start = (now - timedelta(days=days_back)).isoformat()
     end = (now + timedelta(days=days_ahead)).isoformat()
 
+    await ensure_authenticated()                 # sign in off-loop if needed
     client = _client()
     query = CalendarViewRequestBuilder.CalendarViewRequestBuilderGetQueryParameters(
         start_date_time=start,

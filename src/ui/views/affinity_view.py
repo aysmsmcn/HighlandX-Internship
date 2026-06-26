@@ -3,7 +3,8 @@ import re
 from urllib.parse import quote_plus
 
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QPushButton, QListWidget,
-                               QLabel, QSplitter, QTextBrowser, QLineEdit, QComboBox)
+                               QLabel, QSplitter, QTextBrowser, QLineEdit, QComboBox,
+                               QApplication)
 from PySide6.QtCore import Qt, QUrl
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore import QWebEngineProfile, QWebEnginePage
@@ -31,6 +32,20 @@ def _plain(text: str) -> str:
 def _date(d: str | None) -> str:
     """Show just the date part of an ISO timestamp, or an em-dash if missing."""
     return d[:10] if d else "—"
+
+
+def _friendly(err: Exception) -> str:
+    """Turn a raw exception into a short, plain-language message."""
+    text = str(err).lower()
+    if "timed out" in text or "cancel" in text:
+        return "Microsoft sign-in was cancelled or timed out — try again."
+    if any(s in text for s in ("connect", "network", "getaddrinfo", "name or service", "ssl")):
+        return "Couldn't reach the server — check your connection."
+    if "401" in text or "unauthorized" in text:
+        return "Not authorized — your login or API key may need refreshing."
+    if "403" in text or "forbidden" in text:
+        return "Access denied for that request."
+    return f"Something went wrong: {err}"
 
 
 def _titled(title: str, *widgets: QWidget) -> QWidget:
@@ -214,6 +229,7 @@ class AffinityView(QWidget):
     @asyncSlot()
     async def load(self) -> None:
         self.refresh_btn.setEnabled(False)
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         self.status.setText("Loading…")
         try:
             pid = await my_owner_id()
@@ -221,13 +237,12 @@ class AffinityView(QWidget):
             self.status.setText("Checking notes on untouched companies…")
             await self._index_noted_missed()
             self.apply_filter()                 # partitions + builds reminders + sets status
+            await self._load_events()           # Outlook calendar — non-fatal
         except Exception as err:
-            self.status.setText(f"Failed: {err}")
+            self.status.setText(_friendly(err))
+        finally:
+            QApplication.restoreOverrideCursor()
             self.refresh_btn.setEnabled(True)
-            return
-
-        await self._load_events()               # Outlook calendar — non-fatal
-        self.refresh_btn.setEnabled(True)
 
     def apply_filter(self) -> None:
         """Filter by search term, partition into the 3 columns, rebuild reminders."""
@@ -373,7 +388,7 @@ class AffinityView(QWidget):
         try:
             events = await get_calendar_events()
         except Exception as err:
-            self.events_status.setText(f"Calendar load failed: {err}")
+            self.events_status.setText(_friendly(err))
             return
 
         domain_map = {c.domain.lower(): c for c in self._companies if c.domain}
@@ -449,6 +464,7 @@ class AffinityView(QWidget):
             return
         self.side.setVisible(True)
         self.activity_btn.setEnabled(False)
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
 
         # --- relationship summary (firm-wide interaction dates) ---
         self.summary_label.setText("Loading…")
@@ -461,7 +477,7 @@ class AffinityView(QWidget):
                 f"Last meeting: {_date(summary.last_event)}"
             )
         except Exception as err:
-            self.summary_label.setText(f"Summary failed: {err}")
+            self.summary_label.setText(_friendly(err))
 
         # --- timeline: rich interactions (emails + meetings) from Affinity ---
         self.timeline_list.clear()
@@ -493,8 +509,9 @@ class AffinityView(QWidget):
             else:
                 self.notes_status.setText("No notes")
         except Exception as err:
-            self.notes_status.setText(f"Notes load failed: {err}")
+            self.notes_status.setText(_friendly(err))
         finally:
+            QApplication.restoreOverrideCursor()
             self.activity_btn.setEnabled(True)
 
     @asyncSlot()
@@ -514,7 +531,7 @@ class AffinityView(QWidget):
         try:
             msg = await get_message_by_subject(it.subject)
         except Exception as err:
-            self.reader.setMarkdown(meta + f"_Couldn't fetch body: {err}_")
+            self.reader.setMarkdown(meta + f"_{_friendly(err)}_")
             return
         if msg:
             header = (f"<h3 style='margin:0'>{msg.subject}</h3>"
