@@ -135,24 +135,32 @@ class AffinityView(QWidget):
         sv.addWidget(side_split)
         self.side.setVisible(False)
 
-        # --- columns: categories | detail | side ---
-        columns = QSplitter(Qt.Orientation.Horizontal)
-        columns.addWidget(left)
-        columns.addWidget(detail)
-        columns.addWidget(self.side)
-        columns.setStretchFactor(0, 2)
-        columns.setStretchFactor(2, 2)
+        # --- bottom row: company list (left) | selected company [detail | side] (right) ---
+        selected = QSplitter(Qt.Orientation.Horizontal)
+        selected.addWidget(detail)
+        selected.addWidget(self.side)
+        selected.setStretchFactor(1, 2)
+        bottom = QSplitter(Qt.Orientation.Horizontal)
+        bottom.addWidget(left)
+        bottom.addWidget(selected)
 
-        # --- top row: events (left) + reminders (right) ---
+        # --- top row: events (left) | reminders (right) ---
         top = QSplitter(Qt.Orientation.Horizontal)
         top.addWidget(_titled("Events (upcoming)", self.events_status, self.events_list))
         top.addWidget(_titled("Reminders — noted, not contacted",
                               self.reminders_order, self.reminders_status, self.reminders_list))
 
+        # outer vertical splitter → one continuous horizontal divider (top / bottom)
         main_split = QSplitter(Qt.Orientation.Vertical)
         main_split.addWidget(top)
-        main_split.addWidget(columns)
+        main_split.addWidget(bottom)
         main_split.setStretchFactor(1, 3)
+
+        # align the two vertical dividers (top's Events|Reminders with bottom's list|company)
+        top.setSizes([400, 600])
+        bottom.setSizes([400, 600])
+        top.splitterMoved.connect(lambda *_: bottom.setSizes(top.sizes()))
+        bottom.splitterMoved.connect(lambda *_: top.setSizes(bottom.sizes()))
 
         # everything built so far is the "content" (compresses left when the web panel opens)
         content = QWidget()
