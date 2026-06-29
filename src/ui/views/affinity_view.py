@@ -14,6 +14,7 @@ from services.affinity_service import (my_owner_id, list_my_companies, Company,
                                        company_url, get_company_notes, Note,
                                        get_company_summary, Interaction, company_has_notes)
 from services.outlook_service import get_calendar_events, get_message_by_subject
+from services.settings_service import get_setting, set_setting
 
 # Best-guess PitchBook search URL. If it doesn't land on a search, do a search in
 # the panel, copy the address-bar URL, and replace this template ({q} = query).
@@ -22,6 +23,7 @@ PITCHBOOK_HOME_URL = "https://my.pitchbook.com"
 # Raylu company URLs are internally generated (not name-based) → no pre-search;
 # just open the app and let the user navigate/search inside the panel.
 RAYLU_HOME_URL = "https://app.raylu.ai/"
+
 
 
 def _plain(text: str) -> str:
@@ -84,6 +86,7 @@ class AffinityView(QWidget):
         # --- reminders pane (top-right): recently added, not contacted ---
         self.reminders_order = QComboBox()
         self.reminders_order.addItems(["Newest first", "Oldest first"])
+        self.reminders_order.setCurrentText(get_setting("pref.reminders_order", "Newest first"))
         self.reminders_status = QLabel("")
         self.reminders_list = QListWidget()
 
@@ -212,9 +215,9 @@ class AffinityView(QWidget):
 
         self.refresh_btn.clicked.connect(self.load)
         self.search_box.textChanged.connect(self.apply_filter)
+        self.reminders_order.currentIndexChanged.connect(lambda _i: self._on_order_changed())
         self.events_list.currentRowChanged.connect(self.select_from_event)
         self.reminders_list.currentRowChanged.connect(self.select_from_reminder)
-        self.reminders_order.currentIndexChanged.connect(lambda _i: self._build_reminders())
         self.ongoing_list.currentRowChanged.connect(lambda r: self._cat_selected("ongoing", r))
         self.followup_list.currentRowChanged.connect(lambda r: self._cat_selected("followup", r))
         self.missed_list.currentRowChanged.connect(lambda r: self._cat_selected("missed", r))
@@ -549,3 +552,11 @@ class AffinityView(QWidget):
     def show_note(self, row: int) -> None:           # sync — renders selected note
         if 0 <= row < len(self._notes):
             self.reader.setMarkdown(self._notes[row].content or "")
+
+    def _on_order_changed(self) -> None:
+        set_setting("pref.reminders_order", self.reminders_order.currentText())
+        self._build_reminders()
+
+    def reload_prefs(self) -> None:
+        """Re-read the reminders order from settings (called after the Settings dialog closes)."""
+        self.reminders_order.setCurrentText(get_setting("pref.reminders_order", "Newest first"))

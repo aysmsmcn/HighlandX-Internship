@@ -36,6 +36,17 @@ def get_credential() -> InteractiveBrowserCredential:
         )
     return _credential
 
+def sign_out() -> None:
+    """Forget the in-memory credential so the next sign-in re-prompts.
+
+    Note: this clears the session-cached credential, not the on-disk MSAL
+    token cache (azure-identity exposes no clean API for that), so the OS may
+    still silently re-authenticate the same account. Switching accounts is
+    available at the next interactive prompt.
+    """
+    global _credential
+    _credential = None
+
 
 async def ensure_authenticated() -> None:
     """Acquire a Graph token off the event loop, so interactive sign-in never freezes the UI.
