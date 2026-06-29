@@ -1,20 +1,29 @@
 import asyncio
+import json
 import re
+from datetime import datetime, timezone
 from urllib.parse import quote_plus
 
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QPushButton, QListWidget,
                                QLabel, QSplitter, QTextBrowser, QLineEdit, QComboBox,
                                QApplication)
 from PySide6.QtCore import Qt, QUrl
+from PySide6.QtGui import QShortcut, QKeySequence
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore import QWebEngineProfile, QWebEnginePage
 from qasync import asyncSlot
 
 from services.affinity_service import (my_owner_id, list_my_companies, Company,
                                        company_url, get_company_notes, Note,
-                                       get_company_summary, Interaction, company_has_notes)
+                                       get_company_summary, Interaction, company_has_notes,
+                                       companies_to_json, companies_from_json)
 from services.outlook_service import get_calendar_events, get_message_by_subject
 from services.settings_service import get_setting, set_setting
+from services.cache_service import read_cache, write_cache
+
+# Cache keys for the local SQLite store.
+CACHE_COMPANIES = "affinity.companies"
+CACHE_NOTED_IDS = "affinity.noted_ids"
 
 # Best-guess PitchBook search URL. If it doesn't land on a search, do a search in
 # the panel, copy the address-bar URL, and replace this template ({q} = query).
@@ -61,6 +70,17 @@ def _titled(title: str, *widgets: QWidget) -> QWidget:
     return box
 
 
+def _titled_w(title_label: QLabel, *widgets: QWidget) -> QWidget:
+    """Like _titled, but uses a caller-owned title label so its text can change later."""
+    box = QWidget()
+    v = QVBoxLayout(box)
+    v.setContentsMargins(0, 0, 0, 0)
+    v.addWidget(title_label)
+    for w in widgets:
+        v.addWidget(w)
+    return box
+
+
 class AffinityView(QWidget):
     def __init__(self) -> None:
         super().__init__()
@@ -76,8 +96,10 @@ class AffinityView(QWidget):
         self._followup: list[Company] = []        # emailed, not met
         self._missed: list[Company] = []          # untouched
 
-        self.refresh_btn = QPushButton("Load my companies")
-        self.status = QLabel("Click to load your Affinity companies.")
+        self.refresh_btn = QPushButton("Refresh from Affinity")
+        self.refresh_btn.setToolTip("Re-fetch everything from Affinity (slow — minutes). "
+                                    "The app shows cached data instantly on launch.")
+        self.status = QLabel("Loading cached companies…")
 
         # --- events pane (top-left) ---
         self.events_status = QLabel("")
@@ -97,10 +119,18 @@ class AffinityView(QWidget):
         self.ongoing_list = QListWidget()
         self.followup_list = QListWidget()
         self.missed_list = QListWidget()
+
+        self.ongoing_title = QLabel("<b>Ongoing</b>")
+        self.ongoing_title.setToolTip("You've met with these (a meeting is logged).")
+        self.followup_title = QLabel("<b>Follow up</b>")
+        self.followup_title.setToolTip("Emailed, but no meeting logged yet.")
+        self.missed_title = QLabel("<b>Missed</b>")
+        self.missed_title.setToolTip("No email or meeting logged yet.")
+
         cat_split = QSplitter(Qt.Orientation.Horizontal)
-        cat_split.addWidget(_titled("Ongoing", self.ongoing_list))
-        cat_split.addWidget(_titled("Follow up", self.followup_list))
-        cat_split.addWidget(_titled("Missed", self.missed_list))
+        cat_split.addWidget(_titled_w(self.ongoing_title, self.ongoing_list))
+        cat_split.addWidget(_titled_w(self.followup_title, self.followup_list))
+        cat_split.addWidget(_titled_w(self.missed_title, self.missed_list))
         left = QWidget()
         ll = QVBoxLayout(left)
         ll.setContentsMargins(0, 0, 0, 0)
@@ -229,23 +259,74 @@ class AffinityView(QWidget):
         self.timeline_list.currentRowChanged.connect(self.show_timeline_entry)
         self.notes_list.currentRowChanged.connect(self.show_note)
 
+        # --- keyboard shortcuts (kept as attributes so they aren't garbage-collected) ---
+        self._sc_find = QShortcut(QKeySequence.StandardKey.Find, self)        # Ctrl+F
+        self._sc_find.activated.connect(self.search_box.setFocus)
+        self._sc_reload = QShortcut(QKeySequence.StandardKey.Refresh, self)   # F5
+        self._sc_reload.activated.connect(
+            lambda: self.load() if self.refresh_btn.isEnabled() else None)    # ignore while loading
+        self._sc_esc = QShortcut(QKeySequence(Qt.Key.Key_Escape), self)       # Esc
+        self._sc_esc.activated.connect(self.hide_web_panel)
+
+        # Render instantly from the last cached fetch (no network, no MS login).
+        self.load_from_cache()
+
     @asyncSlot()
     async def load(self) -> None:
         self.refresh_btn.setEnabled(False)
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        self.status.setText("Loading…")
+        self.status.setText("Refreshing from Affinity… (this can take a few minutes)")
         try:
             pid = await my_owner_id()
             self._companies = await list_my_companies(pid)
             self.status.setText("Checking notes on untouched companies…")
             await self._index_noted_missed()
+            # Persist to the local cache so the next launch loads instantly.
+            write_cache(CACHE_COMPANIES, companies_to_json(self._companies))
+            updated = write_cache(CACHE_NOTED_IDS, json.dumps(sorted(self._noted_ids)))
             self.apply_filter()                 # partitions + builds reminders + sets status
+            self.status.setText(self.status.text() + f"  ·  updated {self._ago(updated)}")
             await self._load_events()           # Outlook calendar — non-fatal
         except Exception as err:
             self.status.setText(_friendly(err))
         finally:
             QApplication.restoreOverrideCursor()
             self.refresh_btn.setEnabled(True)
+
+    def load_from_cache(self) -> None:
+        """Populate the UI from the local SQLite cache — instant, no network, no MS login."""
+        text, updated = read_cache(CACHE_COMPANIES)
+        if not text:
+            self.status.setText("No cached data yet — click “Refresh from Affinity”.")
+            return
+        try:
+            self._companies = companies_from_json(text)
+            noted_text, _ = read_cache(CACHE_NOTED_IDS)
+            self._noted_ids = set(json.loads(noted_text)) if noted_text else set()
+        except Exception as err:
+            self.status.setText(_friendly(err))
+            return
+        self.apply_filter()                     # partitions + builds reminders + sets status
+        self.status.setText(
+            self.status.text() + f"  ·  cached {self._ago(updated)} (Refresh to update)")
+
+    @staticmethod
+    def _ago(iso: str | None) -> str:
+        """Human-readable 'time since' for an ISO-8601 timestamp."""
+        if not iso:
+            return "unknown"
+        try:
+            then = datetime.fromisoformat(iso)
+            secs = int((datetime.now(timezone.utc) - then).total_seconds())
+        except Exception:
+            return "unknown"
+        if secs < 60:
+            return "just now"
+        if secs < 3600:
+            return f"{secs // 60} min ago"
+        if secs < 86400:
+            return f"{secs // 3600} h ago"
+        return f"{secs // 86400} d ago"
 
     def apply_filter(self) -> None:
         """Filter by search term, partition into the 3 columns, rebuild reminders."""
@@ -262,6 +343,7 @@ class AffinityView(QWidget):
         self._fill(self.ongoing_list, self._ongoing)
         self._fill(self.followup_list, self._followup)
         self._fill(self.missed_list, self._missed)
+        self._update_cat_titles()
         self._build_reminders()
         self.status.setText(
             f"{len(self._companies)} companies — {len(self._ongoing)} ongoing, "
@@ -276,6 +358,12 @@ class AffinityView(QWidget):
             widget.addItem(f"[{c.status}]  {c.name}")
         widget.setCurrentRow(-1)
         widget.blockSignals(False)
+
+    def _update_cat_titles(self) -> None:
+        """Show live counts in the three category column titles."""
+        self.ongoing_title.setText(f"<b>Ongoing ({len(self._ongoing)})</b>")
+        self.followup_title.setText(f"<b>Follow up ({len(self._followup)})</b>")
+        self.missed_title.setText(f"<b>Missed ({len(self._missed)})</b>")
 
     def _build_reminders(self) -> None:
         """Noted-but-not-contacted companies (Missed set that have notes), sorted by date added."""

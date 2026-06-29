@@ -8,7 +8,8 @@ Service layer — wraps httpx. The UI talks to THIS, never to httpx directly.
 The API key comes from keyring (auth.secrets), never from source/config.
 """
 
-from dataclasses import dataclass
+import json
+from dataclasses import dataclass, asdict
 
 import httpx
 
@@ -249,6 +250,33 @@ def _entity_to_company(entry: dict) -> Company:
         last_event=last_event,
         next_event=_interaction(entry, NEXT_EVENT_FIELD_ID),
     )
+
+
+# --- (de)serialization for the local cache ----------------------------------
+
+def companies_to_json(companies: list[Company]) -> str:
+    """Serialize companies (with their nested Interactions) to a JSON string."""
+    return json.dumps([asdict(c) for c in companies])
+
+
+def _interaction_from(d: dict | None) -> Interaction | None:
+    return Interaction(**d) if d else None
+
+
+def companies_from_json(text: str) -> list[Company]:
+    """Rebuild companies from a JSON string produced by companies_to_json."""
+    out: list[Company] = []
+    for d in json.loads(text):
+        out.append(Company(
+            id=d["id"], name=d["name"], domain=d.get("domain"),
+            status=d.get("status"), added=d.get("added"),
+            emailed=d.get("emailed", False), met=d.get("met", False),
+            first_email=_interaction_from(d.get("first_email")),
+            last_email=_interaction_from(d.get("last_email")),
+            last_event=_interaction_from(d.get("last_event")),
+            next_event=_interaction_from(d.get("next_event")),
+        ))
+    return out
 
 
 async def list_my_companies(my_pid: int) -> list[Company]:
