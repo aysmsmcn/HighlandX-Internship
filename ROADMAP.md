@@ -230,7 +230,7 @@ These need resolving as their phase approaches:
 - [x] Phase 2 — Microsoft authentication
 - [x] Phase 3 — Outlook data
 - [x] Phase 4 — External data (Affinity API; pivoted from web scraping to a company-centric view: 3-category browser, calendar Events, per-company relationship summary/timeline/notes, website + Affinity links)
-- [ ] Phase 5 — Integration & polish
+- [x] Phase 5 — Integration & polish (error handling, loading states, settings, UX polish, SQLite caching)
 - [ ] Phase 6 — Packaging
 
 _Update the checkboxes as you complete each phase so Claude Code can see where
