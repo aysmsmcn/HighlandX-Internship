@@ -83,6 +83,20 @@ def _titled_w(title_label: QLabel, *widgets: QWidget) -> QWidget:
     return box
 
 
+class _PopoutWindow(QWidget):
+    """Top-level window that hosts the reminders pane while it's popped out.
+    Closing it (via the window ✕) docks the pane back rather than losing it."""
+
+    def __init__(self, on_close, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowFlag(Qt.WindowType.Window, True)   # own top-level window
+        self._on_close = on_close
+
+    def closeEvent(self, event) -> None:
+        self._on_close()
+        super().closeEvent(event)
+
+
 class AffinityView(QWidget):
     def __init__(self) -> None:
         super().__init__()
@@ -94,6 +108,7 @@ class AffinityView(QWidget):
         self._events: list[dict] = []             # calendar events {company, date, subject}
         self._reminders: list[Company | None] = []   # rows of the reminders/list pane (None = not loaded)
         self._reminder_ids: list[int] = []            # company id per reminders row (for list removal)
+        self._reminders_window: QWidget | None = None  # the popped-out reminders window, if any
         self._noted_ids: set[int] = set()         # org ids that have at least one note
         self._ongoing: list[Company] = []         # emailed + met
         self._followup: list[Company] = []        # emailed, not met
@@ -124,6 +139,8 @@ class AffinityView(QWidget):
         self.del_list_btn = QPushButton("🗑")
         self.del_list_btn.setFixedWidth(28)
         self.del_list_btn.setToolTip("Delete the selected list")
+        self.popout_btn = QPushButton("Pop out")
+        self.popout_btn.setToolTip("Open the reminders pane in its own window")
         self._refresh_list_selector()
         reminders_header = QWidget()
         rh = QHBoxLayout(reminders_header)
@@ -131,6 +148,7 @@ class AffinityView(QWidget):
         rh.addWidget(self.list_selector, 1)
         rh.addWidget(self.add_list_btn)
         rh.addWidget(self.del_list_btn)
+        rh.addWidget(self.popout_btn)
 
         # --- left column: search box + 3 category lists ---
         self.search_box = QLineEdit()
@@ -220,9 +238,11 @@ class AffinityView(QWidget):
         # --- top row: events (left) | reminders (right) ---
         top = QSplitter(Qt.Orientation.Horizontal)
         top.addWidget(_titled("Events (upcoming)", self.events_status, self.events_list))
-        top.addWidget(_titled("Reminders",
-                              reminders_header, self.reminders_order,
-                              self.reminders_status, self.reminders_list))
+        self.reminders_box = _titled("Reminders",
+                                     reminders_header, self.reminders_order,
+                                     self.reminders_status, self.reminders_list)
+        top.addWidget(self.reminders_box)
+        self._reminders_top = top               # splitter to dock the box back into (index 1)
 
         # outer vertical splitter → one continuous horizontal divider (top / bottom)
         main_split = QSplitter(Qt.Orientation.Vertical)
@@ -277,6 +297,7 @@ class AffinityView(QWidget):
             lambda _i: self.del_list_btn.setEnabled(self.list_selector.currentData() is not None))
         self.add_list_btn.clicked.connect(self._create_list)
         self.del_list_btn.clicked.connect(self._delete_current_list)
+        self.popout_btn.clicked.connect(self._toggle_popout)
         self.events_list.currentRowChanged.connect(self.select_from_event)
         self.reminders_list.currentRowChanged.connect(self.select_from_reminder)
         self.reminders_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -469,6 +490,42 @@ class AffinityView(QWidget):
         delete_list(list_id)
         self._refresh_list_selector()          # drops it; selection falls back to the built-in
         self._build_reminders()
+
+    # --- pop the reminders pane out into its own window --------------------
+
+    def _toggle_popout(self) -> None:
+        if self._reminders_window is None:
+            self._popout_reminders()
+        else:
+            self._dock_reminders()
+
+    def _popout_reminders(self) -> None:
+        win = _PopoutWindow(self._on_popout_closed, self)
+        win.setWindowTitle("HighlandX — Reminders")
+        lay = QVBoxLayout(win)
+        lay.setContentsMargins(6, 6, 6, 6)
+        lay.addWidget(self.reminders_box)      # reparents the pane out of the splitter
+        win.resize(360, 520)
+        self._reminders_window = win
+        self.popout_btn.setText("Dock")
+        win.show()
+
+    def _dock_reminders(self) -> None:
+        """Return the pane to the splitter (from the Dock button)."""
+        if self._reminders_window is None:
+            return
+        self._reminders_top.insertWidget(1, self.reminders_box)   # back to its original spot
+        self.popout_btn.setText("Pop out")
+        win, self._reminders_window = self._reminders_window, None
+        win.close()                            # now empty; closeEvent no-ops (window is None)
+
+    def _on_popout_closed(self) -> None:
+        """The pop-out window was closed via its ✕ — dock the pane back so it isn't lost."""
+        if self._reminders_window is None:
+            return                             # already docking via the button
+        self._reminders_top.insertWidget(1, self.reminders_box)
+        self.popout_btn.setText("Pop out")
+        self._reminders_window = None
 
     def _build_reminders(self) -> None:
         """Populate the reminders pane for whichever list is selected in the dropdown."""
