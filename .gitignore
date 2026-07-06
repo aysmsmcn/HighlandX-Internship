@@ -21,6 +21,8 @@ __pycache__/
 build/
 dist/
 *.spec
+# keep our PyInstaller build recipe under version control
+!highlandx.spec
 
 # IDE
 .idea/
