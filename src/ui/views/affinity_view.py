@@ -4,9 +4,9 @@ import re
 from datetime import datetime, timezone
 from urllib.parse import quote_plus
 
-from PySide6.QtWidgets import (QWidget, QVBoxLayout, QPushButton, QListWidget,
+from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QListWidget,
                                QLabel, QSplitter, QTextBrowser, QLineEdit, QComboBox,
-                               QApplication)
+                               QApplication, QInputDialog, QMenu, QMessageBox)
 from PySide6.QtCore import Qt, QUrl, QByteArray
 from PySide6.QtGui import QShortcut, QKeySequence
 from PySide6.QtWebEngineWidgets import QWebEngineView
@@ -20,6 +20,8 @@ from services.affinity_service import (my_owner_id, list_my_companies, Company,
 from services.outlook_service import get_calendar_events, get_message_by_interaction
 from services.settings_service import get_setting, set_setting
 from services.cache_service import read_cache, write_cache
+from services.lists_service import (get_lists, create_list, get_members, add_company,
+                                    remove_company, delete_list)
 
 # Cache keys for the local SQLite store.
 CACHE_COMPANIES = "affinity.companies"
@@ -90,7 +92,8 @@ class AffinityView(QWidget):
         self._notes: list[Note] = []
         self._timeline: list[tuple[str, Interaction]] = []   # (label, interaction)
         self._events: list[dict] = []             # calendar events {company, date, subject}
-        self._reminders: list[Company] = []       # noted, not-contacted (Missed + has notes)
+        self._reminders: list[Company | None] = []   # rows of the reminders/list pane (None = not loaded)
+        self._reminder_ids: list[int] = []            # company id per reminders row (for list removal)
         self._noted_ids: set[int] = set()         # org ids that have at least one note
         self._ongoing: list[Company] = []         # emailed + met
         self._followup: list[Company] = []        # emailed, not met
@@ -105,12 +108,29 @@ class AffinityView(QWidget):
         self.events_status = QLabel("")
         self.events_list = QListWidget()
 
-        # --- reminders pane (top-right): recently added, not contacted ---
+        # --- reminders pane (top-right) ---
         self.reminders_order = QComboBox()
         self.reminders_order.addItems(["Newest first", "Oldest first"])
         self.reminders_order.setCurrentText(get_setting("pref.reminders_order", "Newest first"))
         self.reminders_status = QLabel("")
         self.reminders_list = QListWidget()
+
+        # list selector: built-in "Noted, not contacted" + custom watchlists, with a
+        # "+" to create a new list
+        self.list_selector = QComboBox()
+        self.add_list_btn = QPushButton("+")
+        self.add_list_btn.setFixedWidth(28)
+        self.add_list_btn.setToolTip("Create a new list")
+        self.del_list_btn = QPushButton("🗑")
+        self.del_list_btn.setFixedWidth(28)
+        self.del_list_btn.setToolTip("Delete the selected list")
+        self._refresh_list_selector()
+        reminders_header = QWidget()
+        rh = QHBoxLayout(reminders_header)
+        rh.setContentsMargins(0, 0, 0, 0)
+        rh.addWidget(self.list_selector, 1)
+        rh.addWidget(self.add_list_btn)
+        rh.addWidget(self.del_list_btn)
 
         # --- left column: search box + 3 category lists ---
         self.search_box = QLineEdit()
@@ -145,8 +165,12 @@ class AffinityView(QWidget):
         self.website_btn = QPushButton("Open website")
         self.affinity_btn = QPushButton("Open in Affinity")
         self.activity_btn = QPushButton("Load Activity")
+        self.add_to_list_btn = QPushButton("Add to list")
+        self.add_to_list_menu = QMenu(self)
+        self.add_to_list_btn.setMenu(self.add_to_list_menu)   # dropdown of lists
+        self.add_to_list_menu.aboutToShow.connect(self._populate_add_to_list_menu)
         for b in (self.pitchbook_btn, self.raylu_btn, self.website_btn,
-                  self.affinity_btn, self.activity_btn):
+                  self.affinity_btn, self.activity_btn, self.add_to_list_btn):
             b.setEnabled(False)
         detail = QWidget()
         dl = QVBoxLayout(detail)
@@ -157,6 +181,7 @@ class AffinityView(QWidget):
         dl.addWidget(self.website_btn)
         dl.addWidget(self.affinity_btn)
         dl.addWidget(self.activity_btn)
+        dl.addWidget(self.add_to_list_btn)
         dl.addStretch(1)
 
         # --- side view: summary + timeline + notes + reader ---
@@ -195,8 +220,9 @@ class AffinityView(QWidget):
         # --- top row: events (left) | reminders (right) ---
         top = QSplitter(Qt.Orientation.Horizontal)
         top.addWidget(_titled("Events (upcoming)", self.events_status, self.events_list))
-        top.addWidget(_titled("Reminders — noted, not contacted",
-                              self.reminders_order, self.reminders_status, self.reminders_list))
+        top.addWidget(_titled("Reminders",
+                              reminders_header, self.reminders_order,
+                              self.reminders_status, self.reminders_list))
 
         # outer vertical splitter → one continuous horizontal divider (top / bottom)
         main_split = QSplitter(Qt.Orientation.Vertical)
@@ -246,8 +272,15 @@ class AffinityView(QWidget):
         self.refresh_btn.clicked.connect(self.load)
         self.search_box.textChanged.connect(self.apply_filter)
         self.reminders_order.currentIndexChanged.connect(lambda _i: self._on_order_changed())
+        self.list_selector.currentIndexChanged.connect(lambda _i: self._build_reminders())
+        self.list_selector.currentIndexChanged.connect(
+            lambda _i: self.del_list_btn.setEnabled(self.list_selector.currentData() is not None))
+        self.add_list_btn.clicked.connect(self._create_list)
+        self.del_list_btn.clicked.connect(self._delete_current_list)
         self.events_list.currentRowChanged.connect(self.select_from_event)
         self.reminders_list.currentRowChanged.connect(self.select_from_reminder)
+        self.reminders_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.reminders_list.customContextMenuRequested.connect(self._reminders_context_menu)
         self.ongoing_list.currentRowChanged.connect(lambda r: self._cat_selected("ongoing", r))
         self.followup_list.currentRowChanged.connect(lambda r: self._cat_selected("followup", r))
         self.missed_list.currentRowChanged.connect(lambda r: self._cat_selected("missed", r))
@@ -375,20 +408,102 @@ class AffinityView(QWidget):
         self.followup_title.setText(f"<b>Follow up ({len(self._followup)})</b>")
         self.missed_title.setText(f"<b>Missed ({len(self._missed)})</b>")
 
+    def _refresh_list_selector(self) -> None:
+        """Populate the list dropdown: built-in 'Noted, not contacted' (data=None) + custom lists."""
+        current = self.list_selector.currentData()   # remember selection (list_id or None)
+        self.list_selector.blockSignals(True)
+        self.list_selector.clear()
+        self.list_selector.addItem("Noted, not contacted", None)   # built-in
+        for lid, name in get_lists():
+            self.list_selector.addItem(name, lid)
+        idx = self.list_selector.findData(current)
+        self.list_selector.setCurrentIndex(idx if idx >= 0 else 0)
+        self.list_selector.blockSignals(False)
+        self.del_list_btn.setEnabled(self.list_selector.currentData() is not None)
+
+    def _create_list(self) -> None:
+        name, ok = QInputDialog.getText(self, "New list", "List name:")
+        if not ok or not name.strip():
+            return
+        lid = create_list(name.strip())
+        self._refresh_list_selector()
+        idx = self.list_selector.findData(lid)
+        if idx >= 0:
+            self.list_selector.setCurrentIndex(idx)   # fires _build_reminders via the signal
+
+    def _populate_add_to_list_menu(self) -> None:
+        """Rebuild the 'Add to list' menu from current lists (just before it opens)."""
+        self.add_to_list_menu.clear()
+        for lid, name in get_lists():
+            act = self.add_to_list_menu.addAction(name)
+            act.triggered.connect(
+                lambda checked=False, lid=lid, name=name: self._add_current_to_list(lid, name))
+        self.add_to_list_menu.addSeparator()
+        self.add_to_list_menu.addAction("New list…").triggered.connect(self._new_list_and_add)
+
+    def _add_current_to_list(self, list_id: int, list_name: str) -> None:
+        if not self._current:
+            return
+        add_company(list_id, self._current.id, self._current.name)
+        self.status.setText(f"Added {self._current.name} to “{list_name}”.")
+        if self.list_selector.currentData() == list_id:   # that list is showing → refresh it
+            self._build_reminders()
+
+    def _new_list_and_add(self) -> None:
+        name, ok = QInputDialog.getText(self, "New list", "List name:")
+        if not ok or not name.strip():
+            return
+        lid = create_list(name.strip())
+        self._refresh_list_selector()          # so the reminders dropdown shows it
+        self._add_current_to_list(lid, name.strip())
+
+    def _delete_current_list(self) -> None:
+        list_id = self.list_selector.currentData()
+        if list_id is None:                    # built-in list can't be deleted
+            return
+        name = self.list_selector.currentText()
+        reply = QMessageBox.question(
+            self, "Delete list", f"Delete the list “{name}”? This can't be undone.")
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        delete_list(list_id)
+        self._refresh_list_selector()          # drops it; selection falls back to the built-in
+        self._build_reminders()
+
     def _build_reminders(self) -> None:
-        """Noted-but-not-contacted companies (Missed set that have notes), sorted by date added."""
+        """Populate the reminders pane for whichever list is selected in the dropdown."""
+        list_id = self.list_selector.currentData()   # None = built-in "Noted, not contacted"
         newest_first = self.reminders_order.currentIndex() == 0
-        noted = [c for c in self._missed if c.id in self._noted_ids]
-        self._reminders = sorted(noted, key=lambda c: c.added or "", reverse=newest_first)
+
+        if list_id is None:
+            companies = [c for c in self._missed if c.id in self._noted_ids]
+            companies.sort(key=lambda c: c.added or "", reverse=newest_first)
+            self._reminders = list(companies)
+            self._reminder_ids = [c.id for c in companies]
+            rows = [f"{_date(c.added)}  ·  {c.name}" for c in companies]
+            status = f"{len(companies)} noted, not contacted" if companies else "None"
+        else:
+            by_id = {c.id: c for c in self._companies}
+            # (company_id, Company|None, display name, sort key) per member
+            entries = []
+            for cid, name in get_members(list_id):
+                c = by_id.get(cid)
+                entries.append((cid, c, c.name if c else name, (c.added or "") if c else ""))
+            entries.sort(key=lambda e: e[3], reverse=newest_first)
+            self._reminders = [e[1] for e in entries]
+            self._reminder_ids = [e[0] for e in entries]
+            rows = [f"{(_date(c.added) if c else '—')}  ·  {name}"
+                    f"{'' if c else '  (not in current view)'}"
+                    for _cid, c, name, _key in entries]
+            status = f"{len(entries)} in list" if entries else "Empty — use “Add to list”."
+
         self.reminders_list.blockSignals(True)
         self.reminders_list.clear()
-        for c in self._reminders:
-            self.reminders_list.addItem(f"{_date(c.added)}  ·  {c.name}")
+        for r in rows:
+            self.reminders_list.addItem(r)
         self.reminders_list.setCurrentRow(-1)
         self.reminders_list.blockSignals(False)
-        self.reminders_status.setText(
-            f"{len(self._reminders)} noted, not contacted" if self._reminders else "None"
-        )
+        self.reminders_status.setText(status)
 
     async def _index_noted_missed(self) -> None:
         """Check only the untouched (Missed) companies for notes → _noted_ids."""
@@ -424,7 +539,8 @@ class AffinityView(QWidget):
         self._current = c
         self.detail_name.setText(f"<h2>{c.name}</h2>")
         self.detail_meta.setText(f"Status: {c.status or '—'}   ·   Domain: {c.domain or '—'}")
-        for b in (self.pitchbook_btn, self.raylu_btn, self.affinity_btn, self.activity_btn):
+        for b in (self.pitchbook_btn, self.raylu_btn, self.affinity_btn,
+                  self.activity_btn, self.add_to_list_btn):
             b.setEnabled(True)
         self.website_btn.setEnabled(bool(c.domain))
 
@@ -513,7 +629,30 @@ class AffinityView(QWidget):
 
     def select_from_reminder(self, row: int) -> None:
         if 0 <= row < len(self._reminders):
-            self._select_and_highlight(self._reminders[row])
+            company = self._reminders[row]
+            if company is not None:            # None = a list member not in the current load
+                self._select_and_highlight(company)
+
+    def _reminders_context_menu(self, pos) -> None:
+        """Right-click a row in a custom list to remove that company from it."""
+        list_id = self.list_selector.currentData()
+        if list_id is None:                    # built-in list is computed, not editable
+            return
+        item = self.reminders_list.itemAt(pos)
+        if item is None:
+            return
+        row = self.reminders_list.row(item)
+        if not (0 <= row < len(self._reminder_ids)):
+            return
+        company_id = self._reminder_ids[row]
+        menu = QMenu(self)
+        menu.addAction("Remove from list").triggered.connect(
+            lambda: self._remove_from_current_list(list_id, company_id))
+        menu.exec(self.reminders_list.mapToGlobal(pos))
+
+    def _remove_from_current_list(self, list_id: int, company_id: int) -> None:
+        remove_company(list_id, company_id)
+        self._build_reminders()
 
     # --- web panel (PitchBook / Raylu / website / Affinity) ----------------
 
