@@ -1,4 +1,6 @@
+import re
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 
 from msgraph import GraphServiceClient
 
@@ -80,37 +82,91 @@ async def get_messages_for_domain(domain: str, top: int = 15) -> list[EmailSumma
     return [_message_to_summary(m) for m in (page.value or [])]
 
 
-async def get_message_by_subject(subject: str) -> EmailSummary | None:
-    """Find a message in the signed-in mailbox by subject (for showing its body).
+def _norm_subject(s: str) -> str:
+    """Normalize a subject for comparison: strip Re:/Fw:/Fwd: prefixes, a trailing
+    Affinity thread-count suffix like ' (2)', then trim and lowercase."""
+    s = (s or "").strip().lower()
+    # drop a trailing Affinity thread-count, e.g. "weekly sync (3)" -> "weekly sync"
+    s = re.sub(r"\s*\(\d+\)\s*$", "", s)
+    # drop leading Re:/Fw:/Fwd: prefixes (possibly repeated)
+    while True:
+        stripped = re.sub(r"^(re|fw|fwd)\s*:\s*", "", s)
+        if stripped == s:
+            break
+        s = stripped
+    return s.strip()
 
-    Returns None if no copy is in this mailbox (e.g. the user wasn't a
-    participant) — Graph can only read the signed-in user's own mailbox.
+
+def _to_utc(value) -> datetime | None:
+    """Best-effort parse of an ISO string or datetime to an aware UTC datetime."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+async def get_message_by_interaction(
+    from_address: str | None,
+    sent_at: str | None,
+    subject: str | None = None,
+) -> EmailSummary | None:
+    """Find the mailbox copy of an email logged in Affinity.
+
+    The subject is the selective key, so we search by it (a sender like yourself
+    appears in far too many emails for from+date to narrow usefully). Among the
+    subject matches we disambiguate by the sender Affinity recorded and the
+    interaction date. Subjects are normalized to drop Re:/Fw: prefixes and
+    Affinity's trailing "(N)" thread-count. Returns None if nothing matches.
     """
     if not subject:
         return None
+    want = _norm_subject(subject)
+    when = _to_utc(sent_at)
+
     from msgraph.generated.users.item.messages.messages_request_builder import (
         MessagesRequestBuilder,
     )
+    # Strip Affinity's trailing "(N)" thread-count so the phrase matches real mail.
+    phrase = re.sub(r"\s*\(\d+\)\s*$", "", subject).strip()
 
-    await ensure_authenticated()                 # sign in off-loop if needed
+    await ensure_authenticated()
     client = _client()
+    # KQL scoped to the subject. Graph needs the whole $search value wrapped in
+    # double quotes, with the phrase's own quotes escaped: "subject:\"...\""
     query = MessagesRequestBuilder.MessagesRequestBuilderGetQueryParameters(
-        search=f'"{subject}"', top=10,
+        search=f'"subject:\\"{phrase}\\""', top=50,
     )
     config = MessagesRequestBuilder.MessagesRequestBuilderGetRequestConfiguration(
         query_parameters=query,
     )
     page = await client.me.messages.get(request_configuration=config)
-    target = subject.strip().lower()
     msgs = page.value or []
-    # exact subject first, then "contains" to tolerate Re:/Fwd: prefixes
-    for m in msgs:
-        if (m.subject or "").strip().lower() == target:
-            return _message_to_summary(m)
-    for m in msgs:
-        if target in (m.subject or "").strip().lower():
-            return _message_to_summary(m)
-    return None
+
+    # keep hits whose normalized subject matches, exact first then substring
+    matches = [m for m in msgs if _norm_subject(m.subject or "") == want]
+    if not matches and len(want) >= 4:
+        matches = [m for m in msgs if want in _norm_subject(m.subject or "")]
+    if not matches:
+        return None
+
+    # disambiguate same-subject hits: prefer the sender Affinity recorded, then
+    # the message closest in time to the interaction
+    def _score(m) -> tuple:
+        addr = ""
+        if m.from_ and m.from_.email_address:
+            addr = m.from_.email_address.address or ""
+        from_ok = 0 if (from_address and addr.lower() == from_address.lower()) else 1
+        t = _to_utc(m.sent_date_time)
+        dt = abs((t - when).total_seconds()) if (t and when) else float("inf")
+        return (from_ok, dt)
+
+    return _message_to_summary(min(matches, key=_score))
 
 
 async def get_calendar_events(days_back: int = 0, days_ahead: int = 90) -> list[CalendarEvent]:

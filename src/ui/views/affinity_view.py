@@ -7,7 +7,7 @@ from urllib.parse import quote_plus
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QPushButton, QListWidget,
                                QLabel, QSplitter, QTextBrowser, QLineEdit, QComboBox,
                                QApplication)
-from PySide6.QtCore import Qt, QUrl
+from PySide6.QtCore import Qt, QUrl, QByteArray
 from PySide6.QtGui import QShortcut, QKeySequence
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore import QWebEngineProfile, QWebEnginePage
@@ -17,7 +17,7 @@ from services.affinity_service import (my_owner_id, list_my_companies, Company,
                                        company_url, get_company_notes, Note,
                                        get_company_summary, Interaction, company_has_notes,
                                        companies_to_json, companies_from_json)
-from services.outlook_service import get_calendar_events, get_message_by_subject
+from services.outlook_service import get_calendar_events, get_message_by_interaction
 from services.settings_service import get_setting, set_setting
 from services.cache_service import read_cache, write_cache
 
@@ -270,6 +270,16 @@ class AffinityView(QWidget):
 
         # Render instantly from the last cached fetch (no network, no MS login).
         self.load_from_cache()
+
+        # Remember the user's panel proportions across launches (saved on quit).
+        self._splitters = {
+            "top": top, "bottom": bottom, "cat": cat_split,
+            "selected": selected, "side": side_split, "main": main_split,
+        }
+        self._restore_layout()
+        app = QApplication.instance()
+        if app is not None:
+            app.aboutToQuit.connect(self._save_layout)
 
     @asyncSlot()
     async def load(self) -> None:
@@ -573,10 +583,18 @@ class AffinityView(QWidget):
         # --- timeline: rich interactions (emails + meetings) from Affinity ---
         self.timeline_list.clear()
         self._timeline = []
+        seen: set = set()
         for label, it in [("Next meeting", c.next_event), ("Last meeting", c.last_event),
                           ("Last email", c.last_email), ("First email", c.first_email)]:
-            if it:
-                self._timeline.append((label, it))
+            if not it:
+                continue
+            # a single email is returned as BOTH first_email and last_email (same for a
+            # lone event) — collapse those so the same interaction isn't listed twice
+            key = (it.kind, it.date, it.subject, it.from_address)
+            if key in seen:
+                continue
+            seen.add(key)
+            self._timeline.append((label, it))
         self._timeline.sort(key=lambda t: t[1].date or "", reverse=True)   # newest first
         for label, it in self._timeline:
             icon = "✉" if it.kind == "email" else "📅"
@@ -620,7 +638,7 @@ class AffinityView(QWidget):
         meta = f"### {it.subject}\n\nFrom **{it.who}** · {_date(it.date)}\n\n"
         self.reader.setMarkdown(meta + "_Looking up the message in your mailbox…_")
         try:
-            msg = await get_message_by_subject(it.subject)
+            msg = await get_message_by_interaction(it.from_address, it.date, it.subject)
         except Exception as err:
             self.reader.setMarkdown(meta + f"_{_friendly(err)}_")
             return
@@ -634,7 +652,7 @@ class AffinityView(QWidget):
                 self.reader.setHtml(header + f"<pre style='white-space:pre-wrap'>{msg.body_content}</pre>")
         else:
             self.reader.setMarkdown(
-                meta + "_Not in your mailbox — body unavailable (you weren't a participant)._"
+                meta + "_Couldn't find this message in your mailbox._"
             )
 
     def show_note(self, row: int) -> None:           # sync — renders selected note
@@ -648,3 +666,16 @@ class AffinityView(QWidget):
     def reload_prefs(self) -> None:
         """Re-read the reminders order from settings (called after the Settings dialog closes)."""
         self.reminders_order.setCurrentText(get_setting("pref.reminders_order", "Newest first"))
+
+    def _save_layout(self) -> None:
+        """Persist each splitter's proportions so the layout survives across launches."""
+        for key, sp in self._splitters.items():
+            state = sp.saveState().toBase64().data().decode("ascii")
+            set_setting(f"layout.{key}", state)
+
+    def _restore_layout(self) -> None:
+        """Restore saved splitter proportions, if any were stored on a previous run."""
+        for key, sp in self._splitters.items():
+            text = get_setting(f"layout.{key}")
+            if text:
+                sp.restoreState(QByteArray.fromBase64(text.encode("ascii")))
