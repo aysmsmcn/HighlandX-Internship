@@ -3,7 +3,7 @@ from PySide6.QtWidgets import (QDialog, QVBoxLayout, QGroupBox, QFormLayout,
                                QDialogButtonBox)
 
 from services.settings_service import get_setting, set_setting
-from auth.secrets import set_secret, get_secret, AFFINITY_API_KEY, ANTHROPIC_API_KEY
+from auth.secrets import set_secret, get_secret, AFFINITY_API_KEY
 from auth import ms_auth
 from services import affinity_service
 
@@ -43,21 +43,6 @@ class SettingsDialog(QDialog):
         form.addRow("", save_key_btn)
         form.addRow("", self.key_status)
 
-        # --- Anthropic API key (for AI features) ---
-        self.anthropic_field = QLineEdit()
-        self.anthropic_field.setEchoMode(QLineEdit.EchoMode.Password)
-        anthropic_set = get_secret(ANTHROPIC_API_KEY) is not None
-        self.anthropic_field.setPlaceholderText(
-            "•••• already set" if anthropic_set else "paste API key")
-
-        save_anthropic_btn = QPushButton("Save")
-        save_anthropic_btn.clicked.connect(self._save_anthropic_key)
-
-        self.anthropic_status = QLabel("")
-        form.addRow("Anthropic API key:", self.anthropic_field)
-        form.addRow("", save_anthropic_btn)
-        form.addRow("", self.anthropic_status)
-
         # --- Microsoft sign-out ---
         signout_btn = QPushButton("Sign out of Microsoft")
         signout_btn.clicked.connect(self._sign_out)
@@ -76,15 +61,6 @@ class SettingsDialog(QDialog):
         self.key_field.clear()
         self.key_status.setText("Saved ✓")
 
-    def _save_anthropic_key(self) -> None:
-        text = self.anthropic_field.text().strip()
-        if not text:
-            self.anthropic_status.setText("Enter a key first.")
-            return
-        set_secret(ANTHROPIC_API_KEY, text)
-        self.anthropic_field.clear()
-        self.anthropic_status.setText("Saved ✓")
-
     def _sign_out(self) -> None:
         ms_auth.sign_out()
         self.signout_status.setText("Signed out — you'll be asked to sign in next time.")
@@ -94,7 +70,7 @@ class SettingsDialog(QDialog):
         form = QFormLayout(box)
 
         self.order_combo = QComboBox()
-        self.order_combo.addItems(["Newest first", "Oldest first", "Reach-out date (soonest)"])
+        self.order_combo.addItems(["Newest first", "Oldest first"])
         # load the saved value BEFORE connecting, so this initial set doesn't trigger a save
         self.order_combo.setCurrentText(get_setting("pref.reminders_order", "Newest first"))
         self.order_combo.currentTextChanged.connect(self._save_order)

@@ -18,7 +18,6 @@ for pkg in (
     "msgraph", "msgraph_core",
     "kiota_abstractions", "kiota_http",
     "kiota_serialization_json", "kiota_authentication_azure",
-    "anthropic",
 ):
     try:
         d, b, h = collect_all(pkg)

@@ -22,9 +22,6 @@ from services.settings_service import get_setting, set_setting
 from services.cache_service import read_cache, write_cache
 from services.lists_service import (get_lists, create_list, get_members, add_company,
                                     remove_company, delete_list)
-from services.ai_service import (next_reachout_date, estimate_company,
-                                 has_estimate, is_pass_candidate)
-from ui.dialogs.fundraising_dialog import FundraisingDialog
 
 # Cache keys for the local SQLite store.
 CACHE_COMPANIES = "affinity.companies"
@@ -116,15 +113,10 @@ class AffinityView(QWidget):
         self._ongoing: list[Company] = []         # emailed + met
         self._followup: list[Company] = []        # emailed, not met
         self._missed: list[Company] = []          # untouched
-        self._new_companies: list[Company] = []   # added to Affinity since the last refresh
 
         self.refresh_btn = QPushButton("Refresh from Affinity")
         self.refresh_btn.setToolTip("Re-fetch everything from Affinity (slow — minutes). "
                                     "The app shows cached data instantly on launch.")
-        self.estimate_new_btn = QPushButton("Estimate new")
-        self.estimate_new_btn.setToolTip("Estimate fundraising for companies added to Affinity "
-                                         "since your last refresh")
-        self.estimate_new_btn.setEnabled(False)
         self.status = QLabel("Loading cached companies…")
 
         # --- events pane (top-left) ---
@@ -133,11 +125,8 @@ class AffinityView(QWidget):
 
         # --- reminders pane (top-right) ---
         self.reminders_order = QComboBox()
-        self.reminders_order.addItems(["Newest first", "Oldest first", "Reach-out date (soonest)"])
+        self.reminders_order.addItems(["Newest first", "Oldest first"])
         self.reminders_order.setCurrentText(get_setting("pref.reminders_order", "Newest first"))
-        self.estimate_all_btn = QPushButton("Estimate all")
-        self.estimate_all_btn.setToolTip("Run a fundraising estimate for every company in this "
-                                         "list that doesn't have one yet (uses the Anthropic API)")
         self.reminders_status = QLabel("")
         self.reminders_list = QListWidget()
 
@@ -198,10 +187,8 @@ class AffinityView(QWidget):
         self.add_to_list_menu = QMenu(self)
         self.add_to_list_btn.setMenu(self.add_to_list_menu)   # dropdown of lists
         self.add_to_list_menu.aboutToShow.connect(self._populate_add_to_list_menu)
-        self.fundraising_btn = QPushButton("Estimate fundraising")
         for b in (self.pitchbook_btn, self.raylu_btn, self.website_btn,
-                  self.affinity_btn, self.activity_btn, self.add_to_list_btn,
-                  self.fundraising_btn):
+                  self.affinity_btn, self.activity_btn, self.add_to_list_btn):
             b.setEnabled(False)
         detail = QWidget()
         dl = QVBoxLayout(detail)
@@ -213,7 +200,6 @@ class AffinityView(QWidget):
         dl.addWidget(self.affinity_btn)
         dl.addWidget(self.activity_btn)
         dl.addWidget(self.add_to_list_btn)
-        dl.addWidget(self.fundraising_btn)
         dl.addStretch(1)
 
         # --- side view: summary + timeline + notes + reader ---
@@ -254,7 +240,6 @@ class AffinityView(QWidget):
         top.addWidget(_titled("Events (upcoming)", self.events_status, self.events_list))
         self.reminders_box = _titled("Reminders",
                                      reminders_header, self.reminders_order,
-                                     self.estimate_all_btn,
                                      self.reminders_status, self.reminders_list)
         top.addWidget(self.reminders_box)
         self._reminders_top = top               # splitter to dock the box back into (index 1)
@@ -272,17 +257,10 @@ class AffinityView(QWidget):
         bottom.splitterMoved.connect(lambda *_: top.setSizes(bottom.sizes()))
 
         # everything built so far is the "content" (compresses left when the web panel opens)
-        top_row = QWidget()
-        tr = QHBoxLayout(top_row)
-        tr.setContentsMargins(0, 0, 0, 0)
-        tr.addWidget(self.refresh_btn)
-        tr.addWidget(self.estimate_new_btn)
-        tr.addStretch(1)
-
         content = QWidget()
         cv = QVBoxLayout(content)
         cv.setContentsMargins(0, 0, 0, 0)
-        cv.addWidget(top_row)
+        cv.addWidget(self.refresh_btn)
         cv.addWidget(self.status)
         cv.addWidget(main_split)
 
@@ -320,8 +298,6 @@ class AffinityView(QWidget):
         self.add_list_btn.clicked.connect(self._create_list)
         self.del_list_btn.clicked.connect(self._delete_current_list)
         self.popout_btn.clicked.connect(self._toggle_popout)
-        self.estimate_all_btn.clicked.connect(self._estimate_all)
-        self.estimate_new_btn.clicked.connect(self._estimate_new)
         self.events_list.currentRowChanged.connect(self.select_from_event)
         self.reminders_list.currentRowChanged.connect(self.select_from_reminder)
         self.reminders_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -334,7 +310,6 @@ class AffinityView(QWidget):
         self.website_btn.clicked.connect(self.open_website)
         self.affinity_btn.clicked.connect(self.open_affinity)
         self.activity_btn.clicked.connect(self.load_activity)
-        self.fundraising_btn.clicked.connect(self.open_fundraising)
         self.timeline_list.currentRowChanged.connect(self.show_timeline_entry)
         self.notes_list.currentRowChanged.connect(self.show_note)
 
@@ -374,7 +349,6 @@ class AffinityView(QWidget):
             write_cache(CACHE_COMPANIES, companies_to_json(self._companies))
             updated = write_cache(CACHE_NOTED_IDS, json.dumps(sorted(self._noted_ids)))
             self.apply_filter()                 # partitions + builds reminders + sets status
-            self._detect_new_companies()        # flag companies added since the last refresh
             self.status.setText(self.status.text() + f"  ·  updated {self._ago(updated)}")
             await self._load_events()           # Outlook calendar — non-fatal
         except Exception as err:
@@ -556,44 +530,29 @@ class AffinityView(QWidget):
     def _build_reminders(self) -> None:
         """Populate the reminders pane for whichever list is selected in the dropdown."""
         list_id = self.list_selector.currentData()   # None = built-in "Noted, not contacted"
-        mode = self.reminders_order.currentText()
+        newest_first = self.reminders_order.currentIndex() == 0
 
-        # gather (Company|None, company_id, display_name, added) entries
         if list_id is None:
-            entries = [(c, c.id, c.name, c.added or "")
-                       for c in self._missed if c.id in self._noted_ids]
-            empty, noun = "None", "noted, not contacted"
+            companies = [c for c in self._missed if c.id in self._noted_ids]
+            companies.sort(key=lambda c: c.added or "", reverse=newest_first)
+            self._reminders = list(companies)
+            self._reminder_ids = [c.id for c in companies]
+            rows = [f"{_date(c.added)}  ·  {c.name}" for c in companies]
+            status = f"{len(companies)} noted, not contacted" if companies else "None"
         else:
             by_id = {c.id: c for c in self._companies}
+            # (company_id, Company|None, display name, sort key) per member
             entries = []
             for cid, name in get_members(list_id):
                 c = by_id.get(cid)
-                entries.append((c, cid, c.name if c else name, (c.added or "") if c else ""))
-            empty, noun = "Empty — use “Add to list”.", "in list"
-
-        # attach each company's soonest upcoming suggested reach-out date (from its estimate)
-        rows_data = [(c, cid, name, added, next_reachout_date(cid))
-                     for (c, cid, name, added) in entries]
-
-        if mode == "Reach-out date (soonest)":
-            rows_data.sort(key=lambda e: (e[4] is None, e[4] or ""))   # upcoming first, none last
-        else:
-            rows_data.sort(key=lambda e: e[3], reverse=(mode == "Newest first"))
-
-        self._reminders = [e[0] for e in rows_data]
-        self._reminder_ids = [e[1] for e in rows_data]
-
-        rows = []
-        for c, _cid, name, added, reach in rows_data:
-            day = _date(c.added) if c else (_date(added) if added else "—")
-            row = f"{day}  ·  {name}"
-            if c is None:
-                row += "  (not in current view)"
-            if reach:
-                row += f"   ⟶ reach out {reach}"
-            elif is_pass_candidate(_cid):
-                row += "   ⚑ pass candidate"
-            rows.append(row)
+                entries.append((cid, c, c.name if c else name, (c.added or "") if c else ""))
+            entries.sort(key=lambda e: e[3], reverse=newest_first)
+            self._reminders = [e[1] for e in entries]
+            self._reminder_ids = [e[0] for e in entries]
+            rows = [f"{(_date(c.added) if c else '—')}  ·  {name}"
+                    f"{'' if c else '  (not in current view)'}"
+                    for _cid, c, name, _key in entries]
+            status = f"{len(entries)} in list" if entries else "Empty — use “Add to list”."
 
         self.reminders_list.blockSignals(True)
         self.reminders_list.clear()
@@ -601,77 +560,7 @@ class AffinityView(QWidget):
             self.reminders_list.addItem(r)
         self.reminders_list.setCurrentRow(-1)
         self.reminders_list.blockSignals(False)
-        self.reminders_status.setText(f"{len(rows_data)} {noun}" if rows_data else empty)
-
-    def _detect_new_companies(self) -> None:
-        """Flag companies added to the Deals list since the last refresh (for 'Estimate new').
-        The first refresh just records a baseline so we don't flag the whole list as new."""
-        current = {c.id for c in self._companies}
-        seen_text, _ = read_cache("seen_company_ids")
-        if seen_text:
-            seen = set(json.loads(seen_text))
-            self._new_companies = [c for c in self._companies if c.id not in seen]
-        else:
-            self._new_companies = []          # first refresh: baseline only
-        write_cache("seen_company_ids", json.dumps(sorted(current)))
-        n = len(self._new_companies)
-        self.estimate_new_btn.setText(f"Estimate new ({n})" if n else "Estimate new")
-        self.estimate_new_btn.setEnabled(n > 0)
-
-    @asyncSlot()
-    async def _estimate_all(self) -> None:
-        await self._estimate_batch(self._reminders, "in this list")
-
-    @asyncSlot()
-    async def _estimate_new(self) -> None:
-        await self._estimate_batch(self._new_companies, "newly added")
-
-    async def _estimate_batch(self, companies: list, what: str) -> None:
-        """Estimate companies that have no upcoming reach-out date (never estimated,
-        or their estimate has lapsed), paced under the rate limit. Runs in the
-        background so the UI stays usable."""
-        targets = [c for c in companies if c is not None and not has_estimate(c.id)]
-        if not targets:
-            self.reminders_status.setText(f"No {what} companies need estimating.")
-            return
-        reply = QMessageBox.question(
-            self, "Estimate companies",
-            f"Estimate {len(targets)} companies ({what})? This makes {len(targets)} Anthropic "
-            "API calls and may take a few minutes.")
-        if reply != QMessageBox.StandardButton.Yes:
-            return
-
-        self.estimate_all_btn.setEnabled(False)
-        self.estimate_new_btn.setEnabled(False)
-        done = failed = 0
-        try:
-            for c in targets:
-                try:
-                    await estimate_company(c.id, c.name, c.domain)
-                    done += 1
-                except Exception as err:
-                    if "rate_limit" in str(err).lower() or "429" in str(err):
-                        self.reminders_status.setText(
-                            f"Rate limited — pausing 60s… ({done}/{len(targets)})")
-                        await asyncio.sleep(60)
-                        try:
-                            await estimate_company(c.id, c.name, c.domain)
-                            done += 1
-                        except Exception:
-                            failed += 1
-                    else:
-                        failed += 1
-                self._build_reminders()          # fill in reach-out dates live
-                self.reminders_status.setText(f"Estimating… {done}/{len(targets)}")
-                await asyncio.sleep(12)           # pace under the per-minute rate limit
-        finally:
-            self.estimate_all_btn.setEnabled(True)
-            self.estimate_new_btn.setEnabled(bool(self._new_companies))
-            self._build_reminders()
-            summary = (f"Estimated {done} of {len(targets)} companies"
-                       + (f" — {failed} failed." if failed else "."))
-            self.reminders_status.setText(summary)
-            QMessageBox.information(self, "Estimation complete", summary)
+        self.reminders_status.setText(status)
 
     async def _index_noted_missed(self) -> None:
         """Check only the untouched (Missed) companies for notes → _noted_ids."""
@@ -708,7 +597,7 @@ class AffinityView(QWidget):
         self.detail_name.setText(f"<h2>{c.name}</h2>")
         self.detail_meta.setText(f"Status: {c.status or '—'}   ·   Domain: {c.domain or '—'}")
         for b in (self.pitchbook_btn, self.raylu_btn, self.affinity_btn,
-                  self.activity_btn, self.add_to_list_btn, self.fundraising_btn):
+                  self.activity_btn, self.add_to_list_btn):
             b.setEnabled(True)
         self.website_btn.setEnabled(bool(c.domain))
 
@@ -843,10 +732,6 @@ class AffinityView(QWidget):
             self._web_source = "website"
             self.web_panel.setVisible(True)
             self.web_view.setUrl(QUrl(f"https://{self._current.domain}"))
-
-    def open_fundraising(self) -> None:
-        if self._current:
-            FundraisingDialog(self, self._current).exec()
 
     def open_affinity(self) -> None:
         if self._current:
