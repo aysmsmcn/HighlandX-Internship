@@ -41,3 +41,12 @@ class ListMember(Base):
     list_id: Mapped[int]                # -> company_list.id
     company_id: Mapped[int]             # Affinity organization id
     company_name: Mapped[str]
+
+
+class FitOverride(Base):
+    """A manually-set fit score that overrides the computed heuristic for a company."""
+    __tablename__ = "fit_override"
+
+    company_id: Mapped[int] = mapped_column(primary_key=True)   # Affinity organization id
+    score: Mapped[int]
+    created_at: Mapped[str]             # ISO-8601 timestamp

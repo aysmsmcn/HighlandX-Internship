@@ -13,6 +13,9 @@ __pycache__/
 *.sqlite
 *.sqlite3
 
+# Local logo cache (fetched on demand, not source)
+/logos/
+
 # Secrets / local config (never commit credentials)
 .env
 *.secret

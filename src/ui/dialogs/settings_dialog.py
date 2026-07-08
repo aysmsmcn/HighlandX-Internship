@@ -1,11 +1,12 @@
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QGroupBox, QFormLayout,
                                QLineEdit, QPushButton, QComboBox, QLabel,
-                               QDialogButtonBox)
+                               QSpinBox, QDialogButtonBox)
 
 from services.settings_service import get_setting, set_setting
 from auth.secrets import set_secret, get_secret, AFFINITY_API_KEY
 from auth import ms_auth
 from services import affinity_service
+from ui.views.affinity_view import REMINDERS_ORDER_OPTIONS
 
 
 class SettingsDialog(QDialog):
@@ -70,16 +71,44 @@ class SettingsDialog(QDialog):
         form = QFormLayout(box)
 
         self.order_combo = QComboBox()
-        self.order_combo.addItems(["Newest first", "Oldest first"])
+        self.order_combo.addItems(REMINDERS_ORDER_OPTIONS)
         # load the saved value BEFORE connecting, so this initial set doesn't trigger a save
         self.order_combo.setCurrentText(get_setting("pref.reminders_order", "Newest first"))
         self.order_combo.currentTextChanged.connect(self._save_order)
-
         form.addRow("Reminders order:", self.order_combo)
+
+        # --- fit-score bands for the "How to proceed" suggestion ---
+        self.good_spin = QSpinBox()
+        self.good_spin.setRange(0, 100)
+        self.good_spin.setValue(int(get_setting(
+            "pref.good_fit_threshold", str(affinity_service.DEFAULT_GOOD_FIT_THRESHOLD))))
+        self.good_spin.setToolTip("Fit score at or above this counts as a good fit.")
+        self.good_spin.valueChanged.connect(self._save_thresholds)
+        form.addRow("Good-fit score ≥:", self.good_spin)
+
+        self.pass_spin = QSpinBox()
+        self.pass_spin.setRange(0, 100)
+        self.pass_spin.setValue(int(get_setting(
+            "pref.pass_threshold", str(affinity_service.DEFAULT_PASS_THRESHOLD))))
+        self.pass_spin.setToolTip("Fit score below this is flagged as a likely pass.")
+        self.pass_spin.valueChanged.connect(self._save_thresholds)
+        form.addRow("Pass score <:", self.pass_spin)
+
+        self.threshold_status = QLabel("")
+        form.addRow("", self.threshold_status)
         return box
 
     def _save_order(self, text: str) -> None:
         set_setting("pref.reminders_order", text)
+
+    def _save_thresholds(self) -> None:
+        good, pass_ = self.good_spin.value(), self.pass_spin.value()
+        if pass_ >= good:
+            self.threshold_status.setText("Pass score should be below the good-fit score.")
+            return
+        self.threshold_status.setText("")
+        set_setting("pref.good_fit_threshold", str(good))
+        set_setting("pref.pass_threshold", str(pass_))
 
     def _build_about(self) -> QGroupBox:
         box = QGroupBox("Configuration (read-only)")

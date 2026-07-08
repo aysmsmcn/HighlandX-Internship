@@ -22,6 +22,11 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 # Local SQLite database location (used from Phase 1 onward).
 DB_PATH = DATA_DIR / "highlandx.db"
 
+# On-disk cache of fetched company logos (keyed by domain), so they're only
+# fetched from the network once per company across the app's lifetime.
+LOGOS_DIR = DATA_DIR / "logos"
+LOGOS_DIR.mkdir(parents=True, exist_ok=True)
+
 MS_CLIENT_ID = "9359bdda-d20d-4341-8c73-686f3b9870b8"
 MS_TENANT_ID = "d1247142-0090-45d0-97b1-7a7d8e0a6766"
 GRAPH_SCOPES = ["User.Read", "Mail.Read", "Calendars.Read"]

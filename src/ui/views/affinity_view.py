@@ -1,14 +1,14 @@
 import asyncio
 import json
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
 from urllib.parse import quote_plus
 
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QListWidget,
-                               QLabel, QSplitter, QTextBrowser, QLineEdit, QComboBox,
-                               QApplication, QInputDialog, QMenu, QMessageBox)
-from PySide6.QtCore import Qt, QUrl, QByteArray
-from PySide6.QtGui import QShortcut, QKeySequence
+                               QListWidgetItem, QLabel, QSplitter, QTextBrowser, QLineEdit,
+                               QComboBox, QApplication, QInputDialog, QMenu, QMessageBox)
+from PySide6.QtCore import Qt, QUrl, QByteArray, QSize
+from PySide6.QtGui import QShortcut, QKeySequence, QIcon, QPixmap
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore import QWebEngineProfile, QWebEnginePage
 from qasync import asyncSlot
@@ -16,7 +16,11 @@ from qasync import asyncSlot
 from services.affinity_service import (my_owner_id, list_my_companies, Company,
                                        company_url, get_company_notes, Note,
                                        get_company_summary, Interaction, company_has_notes,
-                                       companies_to_json, companies_from_json)
+                                       companies_to_json, companies_from_json, reach_out_suggestion,
+                                       fit_score, proceed_recommendation,
+                                       DEFAULT_GOOD_FIT_THRESHOLD, DEFAULT_PASS_THRESHOLD)
+from services.fit_service import get_all_overrides, set_override, clear_override
+from services.logo_service import get_logo_bytes
 from services.outlook_service import get_calendar_events, get_message_by_interaction
 from services.settings_service import get_setting, set_setting
 from services.cache_service import read_cache, write_cache
@@ -45,6 +49,151 @@ def _plain(text: str) -> str:
 def _date(d: str | None) -> str:
     """Show just the date part of an ISO timestamp, or an em-dash if missing."""
     return d[:10] if d else "—"
+
+
+def _blank_date(d: str | None) -> str:
+    """Show just the date part of an ISO timestamp, or '---' if missing."""
+    return d[:10] if d else "---"
+
+
+REMINDERS_ORDER_OPTIONS = ["Newest First", "Oldest First",
+                           "Highest Fit Score", "Lowest Fit Score",
+                           "Most urgent first", "Least urgent first"]
+
+LOGO_ICON_SIZE = QSize(28, 28)
+
+
+def _blank_icon() -> QIcon:
+    """A transparent placeholder so rows line up consistently before/without a real logo."""
+    pixmap = QPixmap(LOGO_ICON_SIZE)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    return QIcon(pixmap)
+
+
+def _score_sort_value(company: Company | None, overrides: dict[int, int]) -> int:
+    """Numeric sort value for fit-score ordering; missing data sorts lowest."""
+    if company is None:
+        return -1
+    override = overrides.get(company.id)
+    if override is not None:
+        return override
+    score = fit_score(company).score
+    return score if score is not None else -1
+
+
+def _reachout_sort_key(company: Company | None, most_urgent: bool) -> tuple[int, int]:
+    """Sort key for reach-out urgency (earlier date = more urgent). Companies with no
+    projected reach-out date always sort last, regardless of direction."""
+    d = reach_out_suggestion(company).date if company else None
+    if not d:
+        return (1, 0)                          # undated → always last
+    ordv = date.fromisoformat(d).toordinal()
+    return (0, ordv if most_urgent else -ordv)
+
+
+def _score_label(company: Company, overrides: dict[int, int]) -> str:
+    """The fit score to display: a manual override (marked with *) if one is set,
+    else the computed heuristic, or 'N/A' if there isn't enough data."""
+    override = overrides.get(company.id)
+    if override is not None:
+        return f"{override}*"
+    score = fit_score(company).score
+    return str(score) if score is not None else "N/A"
+
+
+def _factor_effect(factor: float) -> str:
+    """Describe a cadence multiplier's direction: <1 pulls sooner, >1 pushes later."""
+    if factor < 0.99:
+        return "sooner"
+    if factor > 1.01:
+        return "later"
+    return "no change"
+
+
+def _reachout_calc_lines(r) -> list[str]:
+    """The '- ...' bullet breakdown of how a reach-out date was derived (shared by both
+    the timeline detail and the How-to-proceed panel)."""
+    stage_note = r.investment_stage or "unknown stage"
+    default_note = (" (no cadence set for this stage — used the default)"
+                    if r.used_default_cadence else "")
+    lines = [f"- Last raised: {_blank_date(r.last_funding_date)} ({stage_note})"]
+    if r.is_accelerator:
+        lines.append(f"- Small round ({_money(r.last_funding_amount)}) looks like an "
+                     f"accelerator/pre-seed → base cadence {r.base_cadence_months} months "
+                     f"(not the full {stage_note} cadence)")
+    else:
+        lines.append(f"- Base cadence for this stage: {r.base_cadence_months} months{default_note}")
+    # Per-factor adjustments (only shown when the underlying data is present).
+    if r.growth_yoy is not None:
+        lines.append(f"- Headcount growth {r.growth_yoy:.0f}% YoY → "
+                     f"{_factor_effect(r.growth_factor)} (×{r.growth_factor})")
+    if r.runway_per_head is not None:
+        lines.append(f"- Runway ~{_money(r.runway_per_head)}/employee → "
+                     f"{_factor_effect(r.runway_factor)} (×{r.runway_factor})")
+    if r.hires_3mo_pct is not None:
+        lines.append(f"- Hiring {r.hires_3mo_pct:.0f}% in 3mo → "
+                     f"{_factor_effect(r.hiring_factor)} (×{r.hiring_factor})")
+    if r.cadence_months != r.base_cadence_months:
+        lines.append(f"- Adjusted cadence: {r.cadence_months} months "
+                     f"({_factor_effect(r.combined_factor)} overall)")
+    lines.append(f"- Projected next round: ~{_blank_date(r.projected_next_round)}")
+    lines.append(f"- Reach out {r.lead_months} months before that → **{_blank_date(r.date)}**")
+    return lines
+
+
+def _reach_out_markdown(r, heading: str = "Reach out suggestion") -> str:
+    """Render a ReachOutSuggestion (date + the math behind it) as Markdown."""
+    if not r.date:
+        return (f"### {heading}\n\n---\n\n"
+                "No suggestion — this company has no recorded funding date to project from.")
+    return (f"### {heading}\n\n**{_blank_date(r.date)}**\n\n"
+            f"**How this was calculated:**\n\n" + "\n".join(_reachout_calc_lines(r)))
+
+
+def _proceed_markdown(rec, reach, today: str) -> str:
+    """Render a ProceedRecommendation combined with reach-out timing as Markdown.
+    - bad fit → just state it's a bad fit and suggest passing (no timing)
+    - otherwise → show the reach-out date + the math, flagging a date already in the past."""
+    score_txt = "N/A" if rec.score is None else str(rec.score)
+    badge = {"good": "🟢", "marginal": "🟡", "pass": "🔴"}.get(rec.band, "⚪")
+    lines = [f"### {badge} {rec.headline}", "", f"**Fit score: {score_txt}**", ""]
+    if rec.reasons:
+        lines.append("**Why:**")
+        lines.append("")
+        lines.extend(f"- {reason}" for reason in rec.reasons)
+        lines.append("")
+
+    # Bad fit → stop here; no point suggesting when to reach out.
+    if rec.band == "pass":
+        lines.append("**This looks like a bad fit — suggest passing.**")
+        return "\n".join(lines)
+
+    # Good / marginal / unknown → fold in the reach-out timing.
+    lines.append("---")
+    lines.append("")
+    if not reach.date:
+        lines.append("**When to reach out:** ---  (no funding date on file to project from)")
+        return "\n".join(lines)
+
+    if reach.date < today:
+        lines.append(f"**When to reach out: {_blank_date(reach.date)}** "
+                     "— ⚠️ this date has already passed; consider reaching out now.")
+    else:
+        lines.append(f"**When to reach out: {_blank_date(reach.date)}**")
+    lines.append("")
+    lines.extend(_reachout_calc_lines(reach))
+    return "\n".join(lines)
+
+
+def _money(amount: float | None) -> str:
+    """Format a USD amount compactly (e.g. $6.3M), or '---' if missing."""
+    if amount is None:
+        return "---"
+    if amount >= 1_000_000:
+        return f"${amount / 1_000_000:.1f}M"
+    if amount >= 1_000:
+        return f"${amount / 1_000:.0f}K"
+    return f"${amount:,.0f}"
 
 
 def _friendly(err: Exception) -> str:
@@ -113,19 +262,24 @@ class AffinityView(QWidget):
         self._ongoing: list[Company] = []         # emailed + met
         self._followup: list[Company] = []        # emailed, not met
         self._missed: list[Company] = []          # untouched
+        self._overrides: dict[int, int] = get_all_overrides()   # company_id -> manual fit score
+        self._logo_cache: dict[str, QIcon] = {}   # domain -> icon; value is the blank icon on a miss
+        self._domain_rows: dict[str, list[tuple[QListWidget, int]]] = {}   # for patching icons in-place
+        self._blank_icon = _blank_icon()
 
         self.refresh_btn = QPushButton("Refresh from Affinity")
         self.refresh_btn.setToolTip("Re-fetch everything from Affinity (slow — minutes). "
                                     "The app shows cached data instantly on launch.")
         self.status = QLabel("Loading cached companies…")
 
-        # --- events pane (top-left) ---
+        # --- events widgets (shown in the "View Upcoming Events" popup, EventsDialog —
+        # not part of this view's own layout; MainWindow reparents them into the dialog) ---
         self.events_status = QLabel("")
         self.events_list = QListWidget()
 
-        # --- reminders pane (top-right) ---
+        # --- reminders pane (top) ---
         self.reminders_order = QComboBox()
-        self.reminders_order.addItems(["Newest first", "Oldest first"])
+        self.reminders_order.addItems(REMINDERS_ORDER_OPTIONS)
         self.reminders_order.setCurrentText(get_setting("pref.reminders_order", "Newest first"))
         self.reminders_status = QLabel("")
         self.reminders_list = QListWidget()
@@ -157,6 +311,12 @@ class AffinityView(QWidget):
         self.ongoing_list = QListWidget()
         self.followup_list = QListWidget()
         self.missed_list = QListWidget()
+        for lw in (self.ongoing_list, self.followup_list, self.missed_list):
+            lw.setIconSize(LOGO_ICON_SIZE)
+            font = lw.font()
+            font.setPointSize(font.pointSize() + 2)
+            lw.setFont(font)
+            lw.setStyleSheet("QListWidget::item { padding: 5px; }")
 
         self.ongoing_title = QLabel("<b>Ongoing</b>")
         self.ongoing_title.setToolTip("You've met with these (a meeting is logged).")
@@ -183,12 +343,14 @@ class AffinityView(QWidget):
         self.website_btn = QPushButton("Open website")
         self.affinity_btn = QPushButton("Open in Affinity")
         self.activity_btn = QPushButton("Load Activity")
+        self.suggestions_btn = QPushButton("Suggestions")
         self.add_to_list_btn = QPushButton("Add to list")
         self.add_to_list_menu = QMenu(self)
         self.add_to_list_btn.setMenu(self.add_to_list_menu)   # dropdown of lists
         self.add_to_list_menu.aboutToShow.connect(self._populate_add_to_list_menu)
         for b in (self.pitchbook_btn, self.raylu_btn, self.website_btn,
-                  self.affinity_btn, self.activity_btn, self.add_to_list_btn):
+                  self.affinity_btn, self.activity_btn, self.suggestions_btn,
+                  self.add_to_list_btn):
             b.setEnabled(False)
         detail = QWidget()
         dl = QVBoxLayout(detail)
@@ -199,6 +361,7 @@ class AffinityView(QWidget):
         dl.addWidget(self.website_btn)
         dl.addWidget(self.affinity_btn)
         dl.addWidget(self.activity_btn)
+        dl.addWidget(self.suggestions_btn)
         dl.addWidget(self.add_to_list_btn)
         dl.addStretch(1)
 
@@ -226,35 +389,45 @@ class AffinityView(QWidget):
         sv.addWidget(side_split)
         self.side.setVisible(False)
 
-        # --- bottom row: company list (left) | selected company [detail | side] (right) ---
+        # --- suggestions panel: how to proceed (incl. reach-out timing) + email template ---
+        self.suggest_status = QLabel("")
+        self.suggest_proceed = QTextBrowser()
+        self.suggest_email = QTextBrowser()
+
+        suggest_split = QSplitter(Qt.Orientation.Vertical)
+        suggest_split.addWidget(_titled("How to proceed", self.suggest_proceed))
+        suggest_split.addWidget(_titled("Suggested email", self.suggest_email))
+
+        self.suggestions_panel = QWidget()
+        sgv = QVBoxLayout(self.suggestions_panel)
+        sgv.setContentsMargins(0, 0, 0, 0)
+        sgv.addWidget(self.suggest_status)
+        sgv.addWidget(suggest_split)
+        self.suggestions_panel.setVisible(False)
+
+        # --- selected company: detail | side (activity) | suggestions ---
         selected = QSplitter(Qt.Orientation.Horizontal)
         selected.addWidget(detail)
         selected.addWidget(self.side)
+        selected.addWidget(self.suggestions_panel)
         selected.setStretchFactor(1, 2)
-        bottom = QSplitter(Qt.Orientation.Horizontal)
-        bottom.addWidget(left)
-        bottom.addWidget(selected)
+        selected.setStretchFactor(2, 2)
 
-        # --- top row: events (left) | reminders (right) ---
-        top = QSplitter(Qt.Orientation.Horizontal)
-        top.addWidget(_titled("Events (upcoming)", self.events_status, self.events_list))
+        # --- right column: reminders (top) | selected company (bottom), aligned vertically ---
         self.reminders_box = _titled("Reminders",
                                      reminders_header, self.reminders_order,
                                      self.reminders_status, self.reminders_list)
-        top.addWidget(self.reminders_box)
-        self._reminders_top = top               # splitter to dock the box back into (index 1)
+        right_col = QSplitter(Qt.Orientation.Vertical)
+        right_col.addWidget(self.reminders_box)
+        right_col.addWidget(selected)
+        right_col.setStretchFactor(1, 3)        # selected-company area gets most of the height
+        self._reminders_dock = right_col        # splitter to dock the reminders box back into (index 0)
 
-        # outer vertical splitter → one continuous horizontal divider (top / bottom)
-        main_split = QSplitter(Qt.Orientation.Vertical)
-        main_split.addWidget(top)
-        main_split.addWidget(bottom)
-        main_split.setStretchFactor(1, 3)
-
-        # align the two vertical dividers (top's Events|Reminders with bottom's list|company)
-        top.setSizes([400, 600])
-        bottom.setSizes([400, 600])
-        top.splitterMoved.connect(lambda *_: bottom.setSizes(top.sizes()))
-        bottom.splitterMoved.connect(lambda *_: top.setSizes(bottom.sizes()))
+        # outer horizontal splitter: company list (its own full-height column) | right column
+        main_split = QSplitter(Qt.Orientation.Horizontal)
+        main_split.addWidget(left)
+        main_split.addWidget(right_col)
+        main_split.setStretchFactor(1, 2)       # right column gets more width than the company list
 
         # everything built so far is the "content" (compresses left when the web panel opens)
         content = QWidget()
@@ -262,7 +435,10 @@ class AffinityView(QWidget):
         cv.setContentsMargins(0, 0, 0, 0)
         cv.addWidget(self.refresh_btn)
         cv.addWidget(self.status)
-        cv.addWidget(main_split)
+        # stretch=1 so the splitter absorbs all surplus vertical space. Without it, a
+        # horizontal QSplitter's vertical policy is only "Preferred", so leftover height
+        # would instead inflate the status label above it (leaving a big gap).
+        cv.addWidget(main_split, 1)
 
         # --- shared web panel (right side, hidden until requested) ---
         # One persistent profile holds logins for PitchBook, Raylu, Affinity web.
@@ -302,6 +478,8 @@ class AffinityView(QWidget):
         self.reminders_list.currentRowChanged.connect(self.select_from_reminder)
         self.reminders_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.reminders_list.customContextMenuRequested.connect(self._reminders_context_menu)
+        self.detail_name.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.detail_name.customContextMenuRequested.connect(self._detail_name_context_menu)
         self.ongoing_list.currentRowChanged.connect(lambda r: self._cat_selected("ongoing", r))
         self.followup_list.currentRowChanged.connect(lambda r: self._cat_selected("followup", r))
         self.missed_list.currentRowChanged.connect(lambda r: self._cat_selected("missed", r))
@@ -310,8 +488,13 @@ class AffinityView(QWidget):
         self.website_btn.clicked.connect(self.open_website)
         self.affinity_btn.clicked.connect(self.open_affinity)
         self.activity_btn.clicked.connect(self.load_activity)
-        self.timeline_list.currentRowChanged.connect(self.show_timeline_entry)
-        self.notes_list.currentRowChanged.connect(self.show_note)
+        self.suggestions_btn.clicked.connect(self.show_suggestions)
+        # itemClicked (not currentRowChanged) so re-clicking an already-selected row still
+        # re-renders it — currentRowChanged only fires when the row index actually changes,
+        # which breaks re-clicking the same timeline row after selecting something in notes
+        # (each list tracks its own currentRow independently).
+        self.timeline_list.itemClicked.connect(lambda item: self.show_timeline_entry(self.timeline_list.row(item)))
+        self.notes_list.itemClicked.connect(lambda item: self.show_note(self.notes_list.row(item)))
 
         # --- keyboard shortcuts (kept as attributes so they aren't garbage-collected) ---
         self._sc_find = QShortcut(QKeySequence.StandardKey.Find, self)        # Ctrl+F
@@ -327,8 +510,8 @@ class AffinityView(QWidget):
 
         # Remember the user's panel proportions across launches (saved on quit).
         self._splitters = {
-            "top": top, "bottom": bottom, "cat": cat_split,
-            "selected": selected, "side": side_split, "main": main_split,
+            "cat": cat_split, "selected": selected, "side": side_split,
+            "right_col": right_col, "main": main_split,
         }
         self._restore_layout()
         app = QApplication.instance()
@@ -404,24 +587,69 @@ class AffinityView(QWidget):
                 self._followup.append(c)
             else:
                 self._missed.append(c)
-        self._fill(self.ongoing_list, self._ongoing)
-        self._fill(self.followup_list, self._followup)
-        self._fill(self.missed_list, self._missed)
+        self._fill(self.ongoing_list, self._ongoing, self._overrides)
+        self._fill(self.followup_list, self._followup, self._overrides)
+        self._fill(self.missed_list, self._missed, self._overrides)
         self._update_cat_titles()
         self._build_reminders()
         self.status.setText(
             f"{len(self._companies)} companies — {len(self._ongoing)} ongoing, "
             f"{len(self._followup)} follow up, {len(self._missed)} missed"
         )
+        self._start_logo_fetch()
 
-    @staticmethod
-    def _fill(widget: QListWidget, companies: list[Company]) -> None:
+    def _fill(self, widget: QListWidget, companies: list[Company],
+             overrides: dict[int, int]) -> None:
         widget.blockSignals(True)
         widget.clear()
         for c in companies:
-            widget.addItem(f"[{c.status}]  {c.name}")
+            item = QListWidgetItem(f"[{c.status}]  {c.name}  ({_score_label(c, overrides)})")
+            item.setIcon(self._logo_cache.get(c.domain, self._blank_icon) if c.domain
+                        else self._blank_icon)
+            widget.addItem(item)
         widget.setCurrentRow(-1)
         widget.blockSignals(False)
+
+    def _start_logo_fetch(self) -> None:
+        """Kick off (fire-and-forget) fetching logos not already in this session's cache,
+        for every company currently shown across the 3 category lists."""
+        self._domain_rows = {}
+        for widget, companies in ((self.ongoing_list, self._ongoing),
+                                  (self.followup_list, self._followup),
+                                  (self.missed_list, self._missed)):
+            for row, c in enumerate(companies):
+                if c.domain:
+                    self._domain_rows.setdefault(c.domain, []).append((widget, row))
+        missing = [d for d in self._domain_rows if d not in self._logo_cache]
+        if missing:
+            asyncio.ensure_future(self._fetch_logos(missing))
+
+    async def _fetch_logos(self, domains: list[str]) -> None:
+        sem = asyncio.Semaphore(20)
+
+        async def fetch_one(domain: str) -> None:
+            async with sem:
+                try:
+                    data = await get_logo_bytes(domain)
+                except Exception:
+                    data = None
+                icon = self._blank_icon
+                if data:
+                    pixmap = QPixmap()
+                    if pixmap.loadFromData(data):
+                        icon = QIcon(pixmap)
+                self._logo_cache[domain] = icon
+                if icon is not self._blank_icon:
+                    self._apply_icon(domain, icon)
+
+        await asyncio.gather(*(fetch_one(d) for d in domains))
+
+    def _apply_icon(self, domain: str, icon: QIcon) -> None:
+        """Patch the icon into any already-rendered rows for this domain, in place."""
+        for widget, row in self._domain_rows.get(domain, []):
+            item = widget.item(row)
+            if item is not None:
+                item.setIcon(icon)
 
     def _update_cat_titles(self) -> None:
         """Show live counts in the three category column titles."""
@@ -514,7 +742,7 @@ class AffinityView(QWidget):
         """Return the pane to the splitter (from the Dock button)."""
         if self._reminders_window is None:
             return
-        self._reminders_top.insertWidget(1, self.reminders_box)   # back to its original spot
+        self._reminders_dock.insertWidget(0, self.reminders_box)   # back to its original spot
         self.popout_btn.setText("Pop out")
         win, self._reminders_window = self._reminders_window, None
         win.close()                            # now empty; closeEvent no-ops (window is None)
@@ -523,21 +751,32 @@ class AffinityView(QWidget):
         """The pop-out window was closed via its ✕ — dock the pane back so it isn't lost."""
         if self._reminders_window is None:
             return                             # already docking via the button
-        self._reminders_top.insertWidget(1, self.reminders_box)
+        self._reminders_dock.insertWidget(0, self.reminders_box)
         self.popout_btn.setText("Pop out")
         self._reminders_window = None
 
     def _build_reminders(self) -> None:
         """Populate the reminders pane for whichever list is selected in the dropdown."""
         list_id = self.list_selector.currentData()   # None = built-in "Noted, not contacted"
-        newest_first = self.reminders_order.currentIndex() == 0
+        mode = self.reminders_order.currentText()
+        by_score = mode in ("Highest Fit Score", "Lowest Fit Score")
+        by_reachout = mode in ("Most urgent first", "Least urgent first")
+        most_urgent = mode == "Most urgent first"
+        reverse = mode in ("Newest First", "Highest Fit Score")
 
         if list_id is None:
             companies = [c for c in self._missed if c.id in self._noted_ids]
-            companies.sort(key=lambda c: c.added or "", reverse=newest_first)
+            if by_score:
+                companies.sort(key=lambda c: _score_sort_value(c, self._overrides), reverse=reverse)
+            elif by_reachout:
+                companies.sort(key=lambda c: _reachout_sort_key(c, most_urgent))
+            else:
+                companies.sort(key=lambda c: c.added or "", reverse=reverse)
             self._reminders = list(companies)
             self._reminder_ids = [c.id for c in companies]
-            rows = [f"{_date(c.added)}  ·  {c.name}" for c in companies]
+            rows = [f"{c.name}  ({_score_label(c, self._overrides)})"
+                    f"  ·  When to reach out: {reach_out_suggestion(c).date or '---'}"
+                    for c in companies]
             status = f"{len(companies)} noted, not contacted" if companies else "None"
         else:
             by_id = {c.id: c for c in self._companies}
@@ -546,11 +785,17 @@ class AffinityView(QWidget):
             for cid, name in get_members(list_id):
                 c = by_id.get(cid)
                 entries.append((cid, c, c.name if c else name, (c.added or "") if c else ""))
-            entries.sort(key=lambda e: e[3], reverse=newest_first)
+            if by_score:
+                entries.sort(key=lambda e: _score_sort_value(e[1], self._overrides), reverse=reverse)
+            elif by_reachout:
+                entries.sort(key=lambda e: _reachout_sort_key(e[1], most_urgent))
+            else:
+                entries.sort(key=lambda e: e[3], reverse=reverse)
             self._reminders = [e[1] for e in entries]
             self._reminder_ids = [e[0] for e in entries]
-            rows = [f"{(_date(c.added) if c else '—')}  ·  {name}"
-                    f"{'' if c else '  (not in current view)'}"
+            rows = [f"{name}  ({_score_label(c, self._overrides) if c else 'N/A'})"
+                    f"  ·  When to reach out: {reach_out_suggestion(c).date or '---'}" if c
+                    else f"{name}  (N/A)  (not in current view)"
                     for _cid, c, name, _key in entries]
             status = f"{len(entries)} in list" if entries else "Empty — use “Add to list”."
 
@@ -594,10 +839,10 @@ class AffinityView(QWidget):
 
     def select_company(self, c: Company) -> None:
         self._current = c
-        self.detail_name.setText(f"<h2>{c.name}</h2>")
+        self.detail_name.setText(f"<h2>{c.name} ({_score_label(c, self._overrides)})</h2>")
         self.detail_meta.setText(f"Status: {c.status or '—'}   ·   Domain: {c.domain or '—'}")
         for b in (self.pitchbook_btn, self.raylu_btn, self.affinity_btn,
-                  self.activity_btn, self.add_to_list_btn):
+                  self.activity_btn, self.suggestions_btn, self.add_to_list_btn):
             b.setEnabled(True)
         self.website_btn.setEnabled(bool(c.domain))
 
@@ -607,8 +852,48 @@ class AffinityView(QWidget):
             self.load_activity()
         else:
             self._clear_activity()
+        if self.suggestions_panel.isVisible():
+            self.show_suggestions()
+        else:
+            self._clear_suggestions()
         if self.web_panel.isVisible():
             self._reload_web()
+
+    def _detail_name_context_menu(self, pos) -> None:
+        if not self._current:
+            return
+        menu = QMenu(self)
+        menu.addAction("Set fit score override…").triggered.connect(self._set_fit_override)
+        clear_act = menu.addAction("Clear fit score override")
+        clear_act.setEnabled(self._current.id in self._overrides)
+        clear_act.triggered.connect(self._clear_fit_override)
+        menu.exec(self.detail_name.mapToGlobal(pos))
+
+    def _set_fit_override(self) -> None:
+        c = self._current
+        if not c:
+            return
+        current = self._overrides.get(c.id)
+        if current is None:
+            current = fit_score(c).score or 50
+        score, ok = QInputDialog.getInt(
+            self, "Set fit score override", f"Fit score for {c.name} (0-100):",
+            current, 0, 100)
+        if not ok:
+            return
+        set_override(c.id, score)
+        self._overrides[c.id] = score
+        self.detail_name.setText(f"<h2>{c.name} ({_score_label(c, self._overrides)})</h2>")
+        self.apply_filter()
+
+    def _clear_fit_override(self) -> None:
+        c = self._current
+        if not c or c.id not in self._overrides:
+            return
+        clear_override(c.id)
+        del self._overrides[c.id]
+        self.detail_name.setText(f"<h2>{c.name} ({_score_label(c, self._overrides)})</h2>")
+        self.apply_filter()
 
     def _clear_activity(self) -> None:
         self.side.setVisible(False)
@@ -620,6 +905,31 @@ class AffinityView(QWidget):
         self.notes_list.clear()
         self.notes_status.clear()
         self.reader.clear()
+
+    def show_suggestions(self) -> None:
+        """Open the suggestions panel: how to proceed, when to reach out, email template.
+        TODO: "email template" is a placeholder — logic to come later."""
+        c = self._current
+        if not c:
+            return
+        self.suggestions_panel.setVisible(True)
+        self.suggest_status.setText(f"Suggestions for {c.name}")
+
+        good = int(get_setting("pref.good_fit_threshold", str(DEFAULT_GOOD_FIT_THRESHOLD)))
+        pass_ = int(get_setting("pref.pass_threshold", str(DEFAULT_PASS_THRESHOLD)))
+        rec = proceed_recommendation(c, good, pass_, override_score=self._overrides.get(c.id))
+        today = datetime.now(timezone.utc).date().isoformat()
+        self.suggest_proceed.setMarkdown(_proceed_markdown(rec, reach_out_suggestion(c), today))
+
+        self.suggest_email.setMarkdown(
+            "_Coming soon — a suggested email draft will appear here._"
+        )
+
+    def _clear_suggestions(self) -> None:
+        self.suggestions_panel.setVisible(False)
+        self.suggest_status.clear()
+        self.suggest_proceed.clear()
+        self.suggest_email.clear()
 
     def _select_and_highlight(self, company: Company) -> None:
         """Select a company (as if searched) and highlight it in its category column."""
@@ -675,7 +985,9 @@ class AffinityView(QWidget):
 
         self._events.sort(key=lambda r: r["date"] or "")
         for r in self._events:
-            self.events_list.addItem(f"{_date(r['date'])}  ·  {r['company'].name}  —  {r['subject']}")
+            self.events_list.addItem(
+                f"{_date(r['date'])}  ·  {r['company'].name} ({_score_label(r['company'], self._overrides)})"
+                f"  —  {r['subject']}")
         self.events_status.setText(
             f"{len(self._events)} events" if self._events else "No events matched to companies"
         )
@@ -771,7 +1083,10 @@ class AffinityView(QWidget):
                 f"Last contact: {_date(summary.last_contact)}<br>"
                 f"Last email: {_date(summary.last_email)}<br>"
                 f"Next meeting: {_date(summary.next_event)}<br>"
-                f"Last meeting: {_date(summary.last_event)}"
+                f"Last meeting: {_date(summary.last_event)}<br>"
+                f"Last raised: {_blank_date(c.last_funding_date)}<br>"
+                f"Amount last raised: {_money(c.last_funding_amount)}<br>"
+                f"Total amount raised: {_money(c.total_funding_amount)}"
             )
         except Exception as err:
             self.summary_label.setText(_friendly(err))
@@ -792,12 +1107,22 @@ class AffinityView(QWidget):
             seen.add(key)
             self._timeline.append((label, it))
         self._timeline.sort(key=lambda t: t[1].date or "", reverse=True)   # newest first
+
+        # pinned to the top, always shown (even with no data) per the reach-out heuristic
+        self._reach_out = reach_out_suggestion(c)
+        suggestion = Interaction(kind="suggestion", date=self._reach_out.date or "",
+                                 subject="Reach out suggestion", who="")
+        self._timeline.insert(0, ("Reach out suggestion", suggestion))
+
         for label, it in self._timeline:
+            if it.kind == "suggestion":
+                self.timeline_list.addItem(f"Reach out suggestion: {_blank_date(it.date)}")
+                continue
             icon = "✉" if it.kind == "email" else "📅"
             self.timeline_list.addItem(f"{_date(it.date)}  ·  {icon} {it.subject}  —  {it.who}")
+        real_count = len(self._timeline) - 1   # excludes the pinned suggestion row
         self.timeline_status.setText(
-            f"{len(self._timeline)} interactions — click to view"
-            if self._timeline else "No interactions"
+            f"{real_count} interactions — click to view" if real_count else "No interactions"
         )
 
         # --- notes (separate from the timeline) ---
@@ -825,6 +1150,9 @@ class AffinityView(QWidget):
         if not (0 <= row < len(self._timeline)):
             return
         label, it = self._timeline[row]
+        if it.kind == "suggestion":
+            self.reader.setMarkdown(_reach_out_markdown(self._reach_out))
+            return
         if it.kind == "meeting":
             self.reader.setMarkdown(
                 f"### {it.subject}\n\n**{label}** · {_date(it.date)}\n\nAttendees: {it.who or '—'}"
@@ -861,7 +1189,7 @@ class AffinityView(QWidget):
 
     def reload_prefs(self) -> None:
         """Re-read the reminders order from settings (called after the Settings dialog closes)."""
-        self.reminders_order.setCurrentText(get_setting("pref.reminders_order", "Newest first"))
+        self.reminders_order.setCurrentText(get_setting("pref.reminders_order", "Newest First"))
 
     def _save_layout(self) -> None:
         """Persist each splitter's proportions so the layout survives across launches."""
@@ -870,8 +1198,14 @@ class AffinityView(QWidget):
             set_setting(f"layout.{key}", state)
 
     def _restore_layout(self) -> None:
-        """Restore saved splitter proportions, if any were stored on a previous run."""
+        """Restore saved splitter proportions, if any were stored on a previous run.
+        QSplitter.restoreState() also restores ORIENTATION — so a state saved when the
+        layout was arranged differently would silently flip the splitter's direction and
+        override what the code builds. Re-assert the code-defined orientation afterward so
+        only the sizes are honored."""
         for key, sp in self._splitters.items():
             text = get_setting(f"layout.{key}")
             if text:
+                orientation = sp.orientation()
                 sp.restoreState(QByteArray.fromBase64(text.encode("ascii")))
+                sp.setOrientation(orientation)
