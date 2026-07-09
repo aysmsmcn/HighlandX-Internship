@@ -522,23 +522,45 @@ class AffinityView(QWidget):
     async def load(self) -> None:
         self.refresh_btn.setEnabled(False)
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        self.status.setText("Refreshing from Affinity… (this can take a few minutes)")
+        self.status.setText("Refreshing from Affinity…")
         try:
             pid = await my_owner_id()
             self._companies = await list_my_companies(pid)
-            self.status.setText("Checking notes on untouched companies…")
-            await self._index_noted_missed()
-            # Persist to the local cache so the next launch loads instantly.
-            write_cache(CACHE_COMPANIES, companies_to_json(self._companies))
-            updated = write_cache(CACHE_NOTED_IDS, json.dumps(sorted(self._noted_ids)))
-            self.apply_filter()                 # partitions + builds reminders + sets status
-            self.status.setText(self.status.text() + f"  ·  updated {self._ago(updated)}")
-            await self._load_events()           # Outlook calendar — non-fatal
         except Exception as err:
             self.status.setText(_friendly(err))
-        finally:
             QApplication.restoreOverrideCursor()
             self.refresh_btn.setEnabled(True)
+            return
+
+        # Companies are in hand: persist + render them NOW, without waiting on the slow
+        # notes-index and Outlook events. Those finish in the background and update their
+        # own panes when ready, so the company list is usable in seconds.
+        updated = write_cache(CACHE_COMPANIES, companies_to_json(self._companies))
+        self.apply_filter()                     # partitions + builds reminders + sets status
+        self.status.setText(
+            self.status.text() + f"  ·  updated {self._ago(updated)} — loading notes & events…")
+        QApplication.restoreOverrideCursor()
+        asyncio.ensure_future(self._finish_load_background())
+
+    async def _finish_load_background(self) -> None:
+        """The slow, non-critical parts of a refresh — run after companies are on screen."""
+        try:
+            await self._index_noted_background()   # notes-index → reminders pane
+            await self._load_events()              # Outlook calendar (also triggers MS login)
+        finally:
+            self.refresh_btn.setEnabled(True)
+            self.status.setText(self.status.text().replace(" — loading notes & events…", ""))
+
+    async def _index_noted_background(self) -> None:
+        """Rebuild the noted-companies index off the critical path, then refresh the pane."""
+        self.reminders_status.setText("Checking notes… (companies are ready to use)")
+        try:
+            await self._index_noted_missed()
+            write_cache(CACHE_NOTED_IDS, json.dumps(sorted(self._noted_ids)))
+        except Exception as err:
+            self.reminders_status.setText(_friendly(err))
+            return
+        self._build_reminders()                 # rebuild with the fresh noted set
 
     def load_from_cache(self) -> None:
         """Populate the UI from the local SQLite cache — instant, no network, no MS login."""
@@ -808,8 +830,16 @@ class AffinityView(QWidget):
         self.reminders_status.setText(status)
 
     async def _index_noted_missed(self) -> None:
-        """Check only the untouched (Missed) companies for notes → _noted_ids."""
-        untouched = [c for c in self._companies if not c.emailed and not c.met]
+        """Check untouched (Missed) companies for notes → _noted_ids.
+
+        Incremental: companies already known to have notes are kept without re-checking;
+        only untouched companies whose note-status we don't yet know are queried. New notes
+        on not-yet-noted companies are still picked up on every refresh (they get re-checked);
+        the only thing skipped is re-confirming companies already flagged as noted."""
+        untouched_ids = {c.id for c in self._companies if not c.emailed and not c.met}
+        known = self._noted_ids & untouched_ids          # already noted + still untouched → keep
+        to_check = [c for c in self._companies
+                    if c.id in untouched_ids and c.id not in known]
         sem = asyncio.Semaphore(10)            # bound concurrency to be kind to the API
 
         async def check(c: Company) -> int | None:
@@ -819,8 +849,8 @@ class AffinityView(QWidget):
                 except Exception:
                     return None
 
-        results = await asyncio.gather(*(check(c) for c in untouched))
-        self._noted_ids = {cid for cid in results if cid is not None}
+        results = await asyncio.gather(*(check(c) for c in to_check))
+        self._noted_ids = known | {cid for cid in results if cid is not None}
 
     def _cat_selected(self, cat: str, row: int) -> None:
         lst, companies = {

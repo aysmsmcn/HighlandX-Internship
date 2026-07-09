@@ -37,6 +37,13 @@ HIRES_3MO_FIELD_ID = "affinity-data-employee-hires-last-3-months-percentage"  # 
 
 # Only show deals at these early stages (matched case-insensitively):
 ALLOWED_STATUSES = {"new companies", "reached out", "tracking"}
+# Status dropdown option IDs for the ALLOWED_STATUSES labels (from the Deals list's Status
+# field), used to filter server-side in list_my_companies. Keep in sync with ALLOWED_STATUSES.
+STATUS_OPTION_IDS = {
+    "new companies": 11428717,
+    "reached out": 4372360,
+    "tracking": 4372367,
+}
 
 # Reach-out heuristic: typical months between rounds by stage (rough industry
 # averages), minus a lead time so the suggestion lands before the next round.
@@ -258,16 +265,6 @@ def company_url(company_id: int) -> str:
 
 
 # --- v2 list entries (companies on the Deals list, with field values) -------
-
-def _owner_ids(entry: dict) -> list[int]:
-    """Pull the person ids out of the Owners field on a v2 list entry."""
-    ent = entry.get("entity") or {}
-    for field in ent.get("fields", []):
-        if field.get("id") == OWNERS_FIELD_ID:
-            data = (field.get("value") or {}).get("data") or []
-            return [p.get("id") for p in data if isinstance(p, dict) and p.get("id") is not None]
-    return []
-
 
 def _status_text(entry: dict) -> str | None:
     """Pull the Status dropdown label off a v2 list entry."""
@@ -667,29 +664,42 @@ def companies_from_json(text: str) -> list[Company]:
 
 
 async def list_my_companies(my_pid: int) -> list[Company]:
-    """Deals owned by my_pid whose Status is one of ALLOWED_STATUSES."""
+    """Deals owned by my_pid whose Status is one of ALLOWED_STATUSES.
+
+    Uses the v2 filtered-search endpoint so Affinity applies the Owners + Status
+    filters server-side: we fetch only the ~4k matching entries instead of paging
+    the entire ~23k-row Deals list and filtering client-side (~10x faster).
+    Note: this endpoint is POST-only (its nextUrl rejects GET), and the nextUrl
+    carries the fieldIds + cursor, so later pages re-POST to it with the same body.
+    """
     field_ids = ",".join([OWNERS_FIELD_ID, STATUS_FIELD_ID, EMAIL_FIELD_ID,
                           EVENT_FIELD_ID, FIRST_EMAIL_FIELD_ID, NEXT_EVENT_FIELD_ID,
                           FUNDING_DATE_FIELD_ID, FUNDING_AMOUNT_FIELD_ID,
                           TOTAL_FUNDING_FIELD_ID, STAGE_FIELD_ID,
                           EMPLOYEES_FIELD_ID, EMPLOYEES_GROWTH_FIELD_ID,
                           HIRES_3MO_FIELD_ID])
+    option_ids = [STATUS_OPTION_IDS[s] for s in ALLOWED_STATUSES if s in STATUS_OPTION_IDS]
+    body = {
+        "filters": {"operator": "and", "filters": [
+            {"fieldId": OWNERS_FIELD_ID, "valueType": "person-multi",
+             "operator": "has-any-of", "value": [{"id": my_pid}]},
+            {"fieldId": STATUS_FIELD_ID, "valueType": "ranked-dropdown",
+             "operator": "is-any-of",
+             "value": [{"dropdownOptionId": oid} for oid in option_ids]},
+        ]},
+    }
     out: list[Company] = []
     async with httpx.AsyncClient(timeout=30) as client:
-        url = f"{AFFINITY_V2_BASE}/lists/{DEALS_LIST_ID}/list-entries"
+        url = f"{AFFINITY_V2_BASE}/lists/{DEALS_LIST_ID}/list-entries/search"
         params = {"fieldIds": field_ids, "limit": 100}
         while url:
-            resp = await client.get(url, params=params, headers=_bearer_headers())
+            resp = await client.post(url, params=params, json=body, headers=_bearer_headers())
             resp.raise_for_status()
             payload = resp.json()
 
             for entry in payload.get("data", []):
-                if my_pid not in _owner_ids(entry):
-                    continue
-                if (_status_text(entry) or "").lower() not in ALLOWED_STATUSES:
-                    continue
                 out.append(_entity_to_company(entry))
 
             url = (payload.get("pagination") or {}).get("nextUrl")
-            params = None      # nextUrl already carries the cursor + params
+            params = None      # nextUrl already carries fieldIds + cursor
     return out
