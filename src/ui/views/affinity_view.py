@@ -1,14 +1,17 @@
 import asyncio
 import json
+import os
 import re
 from datetime import datetime, timezone, date
 from urllib.parse import quote_plus
+
+from config import LOGOS_DIR
 
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QListWidget,
                                QListWidgetItem, QLabel, QSplitter, QTextBrowser, QLineEdit,
                                QComboBox, QApplication, QInputDialog, QMenu, QMessageBox)
 from PySide6.QtCore import Qt, QUrl, QByteArray, QSize
-from PySide6.QtGui import QShortcut, QKeySequence, QIcon, QPixmap
+from PySide6.QtGui import QShortcut, QKeySequence, QIcon, QPixmap, QColor, QPalette
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore import QWebEngineProfile, QWebEnginePage
 from qasync import asyncSlot
@@ -20,7 +23,8 @@ from services.affinity_service import (my_owner_id, list_my_companies, Company,
                                        fit_score, proceed_recommendation,
                                        DEFAULT_GOOD_FIT_THRESHOLD, DEFAULT_PASS_THRESHOLD)
 from services.fit_service import get_all_overrides, set_override, clear_override
-from services.logo_service import get_logo_bytes
+from services.logo_service import get_logo_bytes, _cache_path
+from ui.company_row_delegate import CompanyRowDelegate, GradientPanel, set_gradient_enabled
 from services.outlook_service import get_calendar_events, get_message_by_interaction
 from services.settings_service import get_setting, set_setting
 from services.cache_service import read_cache, write_cache
@@ -61,6 +65,32 @@ REMINDERS_ORDER_OPTIONS = ["Newest First", "Oldest First",
                            "Most urgent first", "Least urgent first"]
 
 LOGO_ICON_SIZE = QSize(28, 28)
+
+# Company-list categories. The five EXCLUSIVE categories partition every company into
+# exactly one bucket (met > emailed > untouched). "Upcoming meetings" is an OVERLAPPING
+# view: any company with a matched upcoming calendar event, regardless of its bucket — so a
+# company can show under both "Ongoing" and "Upcoming meetings". "all" is the combined view.
+CATEGORY_DEFS = [
+    ("all", "All"),
+    ("ongoing", "Ongoing"),                    # a meeting is logged
+    ("upcoming", "Upcoming meetings"),         # OVERLAPS: matched upcoming calendar event
+    ("followup", "Follow up"),                 # emailed and they replied
+    ("noresponse", "Contacted, no response"),  # only we have emailed them
+    ("noted", "Noted, not contacted"),         # untouched but has a note
+    ("missed", "Missed"),                      # untouched, no note
+]
+_EXCLUSIVE_KEYS = ("ongoing", "followup", "noresponse", "noted", "missed")
+
+# Detail-pane buttons: transparent fill so the company gradient shows through, with a
+# theme-neutral outline + hover so they still read as buttons. QSS on QPushButton is
+# safe (unlike on QListWidget items).
+_DETAIL_BTN_QSS = """
+QPushButton { background: transparent; border: 1px solid rgba(128,128,128,0.55);
+    border-radius: 4px; padding: 5px 8px; }
+QPushButton:hover { background: rgba(128,128,128,0.22); }
+QPushButton:pressed { background: rgba(128,128,128,0.38); }
+QPushButton:disabled { color: rgba(128,128,128,0.55); border-color: rgba(128,128,128,0.28); }
+"""
 
 
 def _blank_icon() -> QIcon:
@@ -221,17 +251,6 @@ def _titled(title: str, *widgets: QWidget) -> QWidget:
     return box
 
 
-def _titled_w(title_label: QLabel, *widgets: QWidget) -> QWidget:
-    """Like _titled, but uses a caller-owned title label so its text can change later."""
-    box = QWidget()
-    v = QVBoxLayout(box)
-    v.setContentsMargins(0, 0, 0, 0)
-    v.addWidget(title_label)
-    for w in widgets:
-        v.addWidget(w)
-    return box
-
-
 class _PopoutWindow(QWidget):
     """Top-level window that hosts the reminders pane while it's popped out.
     Closing it (via the window ✕) docks the pane back rather than losing it."""
@@ -259,13 +278,13 @@ class AffinityView(QWidget):
         self._reminder_ids: list[int] = []            # company id per reminders row (for list removal)
         self._reminders_window: QWidget | None = None  # the popped-out reminders window, if any
         self._noted_ids: set[int] = set()         # org ids that have at least one note
-        self._ongoing: list[Company] = []         # emailed + met
-        self._followup: list[Company] = []        # emailed, not met
-        self._missed: list[Company] = []          # untouched
+        self._categorized: dict[str, list[Company]] = {}   # category key -> companies
+        self._event_company_ids: set[int] = set()          # companies with an upcoming meeting
         self._overrides: dict[int, int] = get_all_overrides()   # company_id -> manual fit score
         self._logo_cache: dict[str, QIcon] = {}   # domain -> icon; value is the blank icon on a miss
         self._domain_rows: dict[str, list[tuple[QListWidget, int]]] = {}   # for patching icons in-place
         self._blank_icon = _blank_icon()
+        self._logo_files: set[str] | None = None   # cached listing of non-empty logo filenames
 
         self.refresh_btn = QPushButton("Refresh from Affinity")
         self.refresh_btn.setToolTip("Re-fetch everything from Affinity (slow — minutes). "
@@ -283,6 +302,15 @@ class AffinityView(QWidget):
         self.reminders_order.setCurrentText(get_setting("pref.reminders_order", "Newest first"))
         self.reminders_status = QLabel("")
         self.reminders_list = QListWidget()
+        # larger, more spaced-out reminder rows (per request: ~1.3x font, ~1.5x spacing)
+        _rem_font = self.reminders_list.font()
+        _rem_font.setPointSizeF(_rem_font.pointSizeF() * 1.3)
+        self.reminders_list.setFont(_rem_font)
+        self.reminders_list.setSpacing(6)
+        self.reminders_list.setIconSize(QSize(20, 20))         # downsized company logo
+        # reminders keep the logo + styling but NO gradient backdrop
+        self.reminders_list.setItemDelegate(
+            CompanyRowDelegate(self.reminders_list, paint_gradient=False, fit_width=False))
 
         # list selector: built-in "Noted, not contacted" + custom watchlists, with a
         # "+" to create a new list
@@ -304,36 +332,36 @@ class AffinityView(QWidget):
         rh.addWidget(self.del_list_btn)
         rh.addWidget(self.popout_btn)
 
-        # --- left column: search box + 3 category lists ---
+        # --- left column: search box + category dropdown + one company list ---
         self.search_box = QLineEdit()
         self.search_box.setPlaceholderText("Search companies…")
         self.search_box.setClearButtonEnabled(True)
-        self.ongoing_list = QListWidget()
-        self.followup_list = QListWidget()
-        self.missed_list = QListWidget()
-        for lw in (self.ongoing_list, self.followup_list, self.missed_list):
-            lw.setIconSize(LOGO_ICON_SIZE)
-            font = lw.font()
-            font.setPointSize(font.pointSize() + 2)
-            lw.setFont(font)
-            lw.setStyleSheet("QListWidget::item { padding: 5px; }")
 
-        self.ongoing_title = QLabel("<b>Ongoing</b>")
-        self.ongoing_title.setToolTip("You've met with these (a meeting is logged).")
-        self.followup_title = QLabel("<b>Follow up</b>")
-        self.followup_title.setToolTip("Emailed, but no meeting logged yet.")
-        self.missed_title = QLabel("<b>Missed</b>")
-        self.missed_title.setToolTip("No email or meeting logged yet.")
+        # dropdown picks which category is shown in the single list below.
+        self.category_selector = QComboBox()
+        self.category_selector.setToolTip(
+            "All  ·  Ongoing (a meeting is logged)  ·  Follow up (emailed, not met)  ·  "
+            "Missed (no email or meeting)")
+        for key, label in CATEGORY_DEFS:
+            self.category_selector.addItem(label, key)
 
-        cat_split = QSplitter(Qt.Orientation.Horizontal)
-        cat_split.addWidget(_titled_w(self.ongoing_title, self.ongoing_list))
-        cat_split.addWidget(_titled_w(self.followup_title, self.followup_list))
-        cat_split.addWidget(_titled_w(self.missed_title, self.missed_list))
+        self.company_list = QListWidget()
+        self.company_list.setIconSize(LOGO_ICON_SIZE)
+        _cfont = self.company_list.font()
+        _cfont.setPointSize(_cfont.pointSize() + 2)
+        self.company_list.setFont(_cfont)
+        self.company_list.setSpacing(3)
+        # no horizontal scrollbar: rows fit the column width (gradient rescales, text elides)
+        self.company_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.company_list.setItemDelegate(CompanyRowDelegate(self.company_list))
+        self._visible_companies: list[Company] = []   # companies currently shown in company_list
+
         left = QWidget()
         ll = QVBoxLayout(left)
         ll.setContentsMargins(0, 0, 0, 0)
         ll.addWidget(self.search_box)
-        ll.addWidget(cat_split)
+        ll.addWidget(self.category_selector)
+        ll.addWidget(self.company_list)
 
         # --- detail pane ---
         self.detail_name = QLabel("Select a company")
@@ -352,8 +380,9 @@ class AffinityView(QWidget):
                   self.affinity_btn, self.activity_btn, self.suggestions_btn,
                   self.add_to_list_btn):
             b.setEnabled(False)
-        detail = QWidget()
-        dl = QVBoxLayout(detail)
+            b.setStyleSheet(_DETAIL_BTN_QSS)   # transparent so the panel gradient shows through
+        self.detail_panel = GradientPanel()   # faint brand-color backdrop
+        dl = QVBoxLayout(self.detail_panel)
         dl.addWidget(self.detail_name)
         dl.addWidget(self.detail_meta)
         dl.addWidget(self.pitchbook_btn)
@@ -375,6 +404,15 @@ class AffinityView(QWidget):
         self.notes_list = QListWidget()
         self.reader = QTextBrowser()
         self.reader.setOpenExternalLinks(True)
+        self.reader.setStyleSheet("background: transparent;")   # let panel gradient show through
+        # Make the timeline/notes lists transparent too — via the PALETTE (Base→transparent
+        # + no viewport auto-fill), NOT a stylesheet, so item rendering stays palette-driven
+        # (a QSS rule on a QListWidget is what caused the earlier row-inversion).
+        for _lst in (self.timeline_list, self.notes_list):
+            _p = _lst.palette()
+            _p.setColor(QPalette.ColorRole.Base, QColor(Qt.GlobalColor.transparent))
+            _lst.setPalette(_p)
+            _lst.viewport().setAutoFillBackground(False)
 
         side_split = QSplitter(Qt.Orientation.Vertical)
         side_split.addWidget(_titled("Relationship (Affinity)", self.summary_label))
@@ -383,7 +421,7 @@ class AffinityView(QWidget):
         side_split.addWidget(_titled("Note details", self.reader))
         side_split.setStretchFactor(3, 2)
 
-        self.side = QWidget()
+        self.side = GradientPanel()            # faint brand-color backdrop
         sv = QVBoxLayout(self.side)
         sv.setContentsMargins(0, 0, 0, 0)
         sv.addWidget(side_split)
@@ -393,12 +431,14 @@ class AffinityView(QWidget):
         self.suggest_status = QLabel("")
         self.suggest_proceed = QTextBrowser()
         self.suggest_email = QTextBrowser()
+        for tb in (self.suggest_proceed, self.suggest_email):
+            tb.setStyleSheet("background: transparent;")   # let panel gradient show through
 
         suggest_split = QSplitter(Qt.Orientation.Vertical)
         suggest_split.addWidget(_titled("How to proceed", self.suggest_proceed))
         suggest_split.addWidget(_titled("Suggested email", self.suggest_email))
 
-        self.suggestions_panel = QWidget()
+        self.suggestions_panel = GradientPanel()   # faint brand-color backdrop
         sgv = QVBoxLayout(self.suggestions_panel)
         sgv.setContentsMargins(0, 0, 0, 0)
         sgv.addWidget(self.suggest_status)
@@ -407,11 +447,15 @@ class AffinityView(QWidget):
 
         # --- selected company: detail | side (activity) | suggestions ---
         selected = QSplitter(Qt.Orientation.Horizontal)
-        selected.addWidget(detail)
+        selected.addWidget(self.detail_panel)
         selected.addWidget(self.side)
         selected.addWidget(self.suggestions_panel)
         selected.setStretchFactor(1, 2)
         selected.setStretchFactor(2, 2)
+        # the three panels share ONE continuous gradient spanning this splitter
+        for _p in (self.detail_panel, self.side, self.suggestions_panel):
+            _p.set_group(selected)
+        selected.splitterMoved.connect(lambda *_: self._refresh_panel_gradients())
 
         # --- right column: reminders (top) | selected company (bottom), aligned vertically ---
         self.reminders_box = _titled("Reminders",
@@ -480,9 +524,8 @@ class AffinityView(QWidget):
         self.reminders_list.customContextMenuRequested.connect(self._reminders_context_menu)
         self.detail_name.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.detail_name.customContextMenuRequested.connect(self._detail_name_context_menu)
-        self.ongoing_list.currentRowChanged.connect(lambda r: self._cat_selected("ongoing", r))
-        self.followup_list.currentRowChanged.connect(lambda r: self._cat_selected("followup", r))
-        self.missed_list.currentRowChanged.connect(lambda r: self._cat_selected("missed", r))
+        self.company_list.currentRowChanged.connect(self._company_selected)
+        self.category_selector.currentIndexChanged.connect(lambda _i: self._display_companies())
         self.pitchbook_btn.clicked.connect(self.open_pitchbook)
         self.raylu_btn.clicked.connect(self.open_raylu)
         self.website_btn.clicked.connect(self.open_website)
@@ -510,7 +553,7 @@ class AffinityView(QWidget):
 
         # Remember the user's panel proportions across launches (saved on quit).
         self._splitters = {
-            "cat": cat_split, "selected": selected, "side": side_split,
+            "selected": selected, "side": side_split,
             "right_col": right_col, "main": main_split,
         }
         self._restore_layout()
@@ -552,15 +595,14 @@ class AffinityView(QWidget):
             self.status.setText(self.status.text().replace(" — loading notes & events…", ""))
 
     async def _index_noted_background(self) -> None:
-        """Rebuild the noted-companies index off the critical path, then refresh the pane."""
-        self.reminders_status.setText("Checking notes… (companies are ready to use)")
+        """Rebuild the noted-companies index off the critical path, then re-bucket."""
+        self.status.setText(self.status.text() + "  ·  checking notes…")
         try:
             await self._index_noted_missed()
             write_cache(CACHE_NOTED_IDS, json.dumps(sorted(self._noted_ids)))
-        except Exception as err:
-            self.reminders_status.setText(_friendly(err))
+        except Exception:
             return
-        self._build_reminders()                 # rebuild with the fresh noted set
+        self.apply_filter()                      # re-bucket so "Noted, not contacted" reflects notes
 
     def load_from_cache(self) -> None:
         """Populate the UI from the local SQLite cache — instant, no network, no MS login."""
@@ -598,50 +640,80 @@ class AffinityView(QWidget):
         return f"{secs // 86400} d ago"
 
     def apply_filter(self) -> None:
-        """Filter by search term, partition into the 3 columns, rebuild reminders."""
+        """Filter by search term, bucket into mutually-exclusive categories, show selection."""
         term = self.search_box.text().strip().lower()
         visible = [c for c in self._companies if term in c.name.lower()]
-        self._ongoing, self._followup, self._missed = [], [], []
+        self._event_company_ids = {e["company"].id for e in self._events}
+        buckets: dict[str, list[Company]] = {k: [] for k in _EXCLUSIVE_KEYS}
         for c in visible:
-            if c.met:
-                self._ongoing.append(c)
-            elif c.emailed:
-                self._followup.append(c)
-            else:
-                self._missed.append(c)
-        self._fill(self.ongoing_list, self._ongoing, self._overrides)
-        self._fill(self.followup_list, self._followup, self._overrides)
-        self._fill(self.missed_list, self._missed, self._overrides)
-        self._update_cat_titles()
+            buckets[self._categorize(c)].append(c)
+        # "Upcoming meetings" overlaps the exclusive buckets (a company can be in both).
+        buckets["upcoming"] = [c for c in visible if c.id in self._event_company_ids]
+        self._categorized = buckets
+        self._update_cat_counts()
+        self._display_companies()               # fills the single list + starts logo fetch
         self._build_reminders()
-        self.status.setText(
-            f"{len(self._companies)} companies — {len(self._ongoing)} ongoing, "
-            f"{len(self._followup)} follow up, {len(self._missed)} missed"
-        )
+        self.status.setText(f"{len(self._companies)} companies")
+
+    def _categorize(self, c: Company) -> str:
+        """The company's single EXCLUSIVE bucket (upcoming meetings is handled separately)."""
+        if c.met:
+            return "ongoing"
+        if c.emailed:
+            return "followup" if self._has_response(c) else "noresponse"
+        if c.id in self._noted_ids:
+            return "noted"
+        return "missed"
+
+    def _has_response(self, c: Company) -> bool:
+        """True if the company has emailed us back — a known email is from their domain."""
+        dom = (c.domain or "").lower()
+        if not dom:
+            return False
+        for e in (c.first_email, c.last_email):
+            if e and e.from_address and dom in e.from_address.lower():
+                return True
+        return False
+
+    def _companies_for_category(self, key: str) -> list[Company]:
+        """The company list for a dropdown category key."""
+        if key == "all":
+            out: list[Company] = []
+            for k in _EXCLUSIVE_KEYS:            # exclude "upcoming" so companies aren't duplicated
+                out += self._categorized.get(k, [])
+            return out
+        return self._categorized.get(key, [])
+
+    def _display_companies(self) -> None:
+        """Show the currently-selected category in the single company list."""
+        key = self.category_selector.currentData() or "all"
+        self._visible_companies = self._companies_for_category(key)
+        self._fill(self.company_list, self._visible_companies, self._overrides)
         self._start_logo_fetch()
+
+    def _company_selected(self, row: int) -> None:
+        if 0 <= row < len(self._visible_companies):
+            self.select_company(self._visible_companies[row])
 
     def _fill(self, widget: QListWidget, companies: list[Company],
              overrides: dict[int, int]) -> None:
         widget.blockSignals(True)
         widget.clear()
         for c in companies:
-            item = QListWidgetItem(f"[{c.status}]  {c.name}  ({_score_label(c, overrides)})")
-            item.setIcon(self._logo_cache.get(c.domain, self._blank_icon) if c.domain
-                        else self._blank_icon)
+            item = QListWidgetItem(f"{c.name}  ({_score_label(c, overrides)})")
+            item.setIcon(self._row_icon(c.domain))            # lazy disk icon (or blank if none)
+            item.setData(Qt.ItemDataRole.UserRole, c.domain)   # delegate reads this for brand colors
             widget.addItem(item)
         widget.setCurrentRow(-1)
         widget.blockSignals(False)
 
     def _start_logo_fetch(self) -> None:
         """Kick off (fire-and-forget) fetching logos not already in this session's cache,
-        for every company currently shown across the 3 category lists."""
+        for every company currently shown in the company list."""
         self._domain_rows = {}
-        for widget, companies in ((self.ongoing_list, self._ongoing),
-                                  (self.followup_list, self._followup),
-                                  (self.missed_list, self._missed)):
-            for row, c in enumerate(companies):
-                if c.domain:
-                    self._domain_rows.setdefault(c.domain, []).append((widget, row))
+        for row, c in enumerate(self._visible_companies):
+            if c.domain:
+                self._domain_rows.setdefault(c.domain, []).append((self.company_list, row))
         missing = [d for d in self._domain_rows if d not in self._logo_cache]
         if missing:
             asyncio.ensure_future(self._fetch_logos(missing))
@@ -673,22 +745,27 @@ class AffinityView(QWidget):
             if item is not None:
                 item.setIcon(icon)
 
-    def _update_cat_titles(self) -> None:
-        """Show live counts in the three category column titles."""
-        self.ongoing_title.setText(f"<b>Ongoing ({len(self._ongoing)})</b>")
-        self.followup_title.setText(f"<b>Follow up ({len(self._followup)})</b>")
-        self.missed_title.setText(f"<b>Missed ({len(self._missed)})</b>")
+    def _update_cat_counts(self) -> None:
+        """Show live counts in the category dropdown labels (without firing its signal)."""
+        total = sum(len(self._categorized.get(k, [])) for k in _EXCLUSIVE_KEYS)
+        labels = dict(CATEGORY_DEFS)
+        self.category_selector.blockSignals(True)
+        for i in range(self.category_selector.count()):
+            key = self.category_selector.itemData(i)
+            n = total if key == "all" else len(self._categorized.get(key, []))
+            self.category_selector.setItemText(i, f"{labels[key]} ({n})")
+        self.category_selector.blockSignals(False)
 
     def _refresh_list_selector(self) -> None:
-        """Populate the list dropdown: built-in 'Noted, not contacted' (data=None) + custom lists."""
+        """Populate the list dropdown with the user's custom watchlists (may be empty)."""
         current = self.list_selector.currentData()   # remember selection (list_id or None)
         self.list_selector.blockSignals(True)
         self.list_selector.clear()
-        self.list_selector.addItem("Noted, not contacted", None)   # built-in
         for lid, name in get_lists():
             self.list_selector.addItem(name, lid)
         idx = self.list_selector.findData(current)
-        self.list_selector.setCurrentIndex(idx if idx >= 0 else 0)
+        self.list_selector.setCurrentIndex(
+            idx if idx >= 0 else (0 if self.list_selector.count() else -1))
         self.list_selector.blockSignals(False)
         self.del_list_btn.setEnabled(self.list_selector.currentData() is not None)
 
@@ -778,8 +855,8 @@ class AffinityView(QWidget):
         self._reminders_window = None
 
     def _build_reminders(self) -> None:
-        """Populate the reminders pane for whichever list is selected in the dropdown."""
-        list_id = self.list_selector.currentData()   # None = built-in "Noted, not contacted"
+        """Populate the reminders pane for the selected custom watchlist (empty if none)."""
+        list_id = self.list_selector.currentData()   # None = no custom list selected/exists
         mode = self.reminders_order.currentText()
         by_score = mode in ("Highest Fit Score", "Lowest Fit Score")
         by_reachout = mode in ("Most urgent first", "Least urgent first")
@@ -787,19 +864,10 @@ class AffinityView(QWidget):
         reverse = mode in ("Newest First", "Highest Fit Score")
 
         if list_id is None:
-            companies = [c for c in self._missed if c.id in self._noted_ids]
-            if by_score:
-                companies.sort(key=lambda c: _score_sort_value(c, self._overrides), reverse=reverse)
-            elif by_reachout:
-                companies.sort(key=lambda c: _reachout_sort_key(c, most_urgent))
-            else:
-                companies.sort(key=lambda c: c.added or "", reverse=reverse)
-            self._reminders = list(companies)
-            self._reminder_ids = [c.id for c in companies]
-            rows = [f"{c.name}  ({_score_label(c, self._overrides)})"
-                    f"  ·  When to reach out: {reach_out_suggestion(c).date or '---'}"
-                    for c in companies]
-            status = f"{len(companies)} noted, not contacted" if companies else "None"
+            self._reminders = []
+            self._reminder_ids = []
+            rows: list[str] = []
+            status = "No lists yet — use “+” to create one."
         else:
             by_id = {c.id: c for c in self._companies}
             # (company_id, Company|None, display name, sort key) per member
@@ -823,11 +891,53 @@ class AffinityView(QWidget):
 
         self.reminders_list.blockSignals(True)
         self.reminders_list.clear()
-        for r in rows:
-            self.reminders_list.addItem(r)
+        for text, comp in zip(rows, self._reminders):
+            item = QListWidgetItem(text)
+            domain = comp.domain if comp else None
+            item.setIcon(self._row_icon(domain))
+            item.setData(Qt.ItemDataRole.UserRole, domain)   # delegate reads this for brand colors
+            self.reminders_list.addItem(item)
         self.reminders_list.setCurrentRow(-1)
         self.reminders_list.blockSignals(False)
         self.reminders_status.setText(status)
+
+    def set_gradient_enabled(self, on: bool) -> None:
+        """Toggle the brand-color gradient backdrop and repaint everything affected."""
+        set_gradient_enabled(on)
+        self.company_list.viewport().update()
+        self._refresh_panel_gradients()
+
+    def _refresh_panel_gradients(self) -> None:
+        """Repaint all three panels so their shared continuous gradient stays aligned
+        (offsets/total change whenever one shows, hides, or is resized)."""
+        for panel in (self.detail_panel, self.side, self.suggestions_panel):
+            panel.refresh()
+
+    def _available_logos(self) -> set[str]:
+        """Filenames of non-empty logo files on disk, scanned once (one dir walk, not a
+        stat() per company)."""
+        if self._logo_files is None:
+            try:
+                self._logo_files = {e.name for e in os.scandir(LOGOS_DIR)
+                                    if e.is_file() and e.stat().st_size > 0}
+            except OSError:
+                self._logo_files = set()
+        return self._logo_files
+
+    def _row_icon(self, domain: str | None):
+        """The logo QIcon for a domain — from the session cache, else lazily from the warm
+        disk cache. QIcon(path) is lazy: Qt only decodes the image when a row is actually
+        painted (≈the handful of visible rows), instead of decoding all ~4k up front."""
+        if not domain:
+            return self._blank_icon
+        if domain in self._logo_cache:
+            return self._logo_cache[domain]
+        path = _cache_path(domain)
+        if path.name in self._available_logos():
+            icon = QIcon(str(path))          # lazy — decoded on paint, not now
+            self._logo_cache[domain] = icon
+            return icon
+        return self._blank_icon              # no disk file → _start_logo_fetch will network-fetch
 
     async def _index_noted_missed(self) -> None:
         """Check untouched (Missed) companies for notes → _noted_ids.
@@ -852,25 +962,12 @@ class AffinityView(QWidget):
         results = await asyncio.gather(*(check(c) for c in to_check))
         self._noted_ids = known | {cid for cid in results if cid is not None}
 
-    def _cat_selected(self, cat: str, row: int) -> None:
-        lst, companies = {
-            "ongoing": (self.ongoing_list, self._ongoing),
-            "followup": (self.followup_list, self._followup),
-            "missed": (self.missed_list, self._missed),
-        }[cat]
-        if not (0 <= row < len(companies)):
-            return
-        for other in (self.ongoing_list, self.followup_list, self.missed_list):
-            if other is not lst:
-                other.blockSignals(True)
-                other.setCurrentRow(-1)
-                other.blockSignals(False)
-        self.select_company(companies[row])
-
     def select_company(self, c: Company) -> None:
         self._current = c
         self.detail_name.setText(f"<h2>{c.name} ({_score_label(c, self._overrides)})</h2>")
         self.detail_meta.setText(f"Status: {c.status or '—'}   ·   Domain: {c.domain or '—'}")
+        for panel in (self.detail_panel, self.side, self.suggestions_panel):
+            panel.set_domain(c.domain)         # faint brand-color backdrop for this company
         for b in (self.pitchbook_btn, self.raylu_btn, self.affinity_btn,
                   self.activity_btn, self.suggestions_btn, self.add_to_list_btn):
             b.setEnabled(True)
@@ -927,6 +1024,7 @@ class AffinityView(QWidget):
 
     def _clear_activity(self) -> None:
         self.side.setVisible(False)
+        self._refresh_panel_gradients()
         self._notes = []
         self._timeline = []
         self.summary_label.clear()
@@ -943,6 +1041,7 @@ class AffinityView(QWidget):
         if not c:
             return
         self.suggestions_panel.setVisible(True)
+        self._refresh_panel_gradients()
         self.suggest_status.setText(f"Suggestions for {c.name}")
 
         good = int(get_setting("pref.good_fit_threshold", str(DEFAULT_GOOD_FIT_THRESHOLD)))
@@ -957,20 +1056,34 @@ class AffinityView(QWidget):
 
     def _clear_suggestions(self) -> None:
         self.suggestions_panel.setVisible(False)
+        self._refresh_panel_gradients()
         self.suggest_status.clear()
         self.suggest_proceed.clear()
         self.suggest_email.clear()
 
-    def _select_and_highlight(self, company: Company) -> None:
-        """Select a company (as if searched) and highlight it in its category column."""
-        self.search_box.clear()                 # clears filter → repartitions all companies
-        self.select_company(company)
-        for lst, arr in [(self.ongoing_list, self._ongoing),
-                         (self.followup_list, self._followup),
-                         (self.missed_list, self._missed)]:
-            lst.blockSignals(True)
-            lst.setCurrentRow(arr.index(company) if company in arr else -1)
-            lst.blockSignals(False)
+    def _select_and_highlight(self, company: Company, prefer: str | None = None) -> None:
+        """Clear the search, switch the dropdown to the company's category, select it.
+        prefer picks a specific category to show it in (e.g. 'upcoming' from the Events pane)."""
+        self.search_box.blockSignals(True)
+        self.search_box.clear()
+        self.search_box.blockSignals(False)
+        self.apply_filter()                      # rebucket with no search term
+
+        cat = prefer if prefer and any(c.id == company.id
+                                       for c in self._categorized.get(prefer, [])) \
+            else self._categorize(company)
+        idx = self.category_selector.findData(cat)
+        if idx >= 0:
+            self.category_selector.blockSignals(True)
+            self.category_selector.setCurrentIndex(idx)
+            self.category_selector.blockSignals(False)
+            self._display_companies()
+
+        row = next((i for i, c in enumerate(self._visible_companies) if c.id == company.id), -1)
+        if row >= 0:
+            self.company_list.setCurrentRow(row)   # fires _company_selected → select_company
+        else:
+            self.select_company(company)           # not in current view (e.g. filtered out)
 
     # --- events (Outlook calendar) -----------------------------------------
 
@@ -1021,10 +1134,12 @@ class AffinityView(QWidget):
         self.events_status.setText(
             f"{len(self._events)} events" if self._events else "No events matched to companies"
         )
+        # events just loaded → rebucket so the "Upcoming meetings" category reflects them
+        self.apply_filter()
 
     def select_from_event(self, row: int) -> None:
         if 0 <= row < len(self._events):
-            self._select_and_highlight(self._events[row]["company"])
+            self._select_and_highlight(self._events[row]["company"], prefer="upcoming")
 
     def select_from_reminder(self, row: int) -> None:
         if 0 <= row < len(self._reminders):
@@ -1102,6 +1217,7 @@ class AffinityView(QWidget):
         if not c:
             return
         self.side.setVisible(True)
+        self._refresh_panel_gradients()
         self.activity_btn.setEnabled(False)
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
 
