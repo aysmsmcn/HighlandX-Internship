@@ -121,6 +121,25 @@ def _reachout_sort_key(company: Company | None, most_urgent: bool) -> tuple[int,
     return (0, ordv if most_urgent else -ordv)
 
 
+def sort_companies(items, mode: str, overrides: dict[int, int], key=lambda c: c):
+    """Order items by a REMINDERS_ORDER_OPTIONS mode (shared by the reminders pane
+    and the main company list so both stay consistent). `key` maps each item to its
+    Company — identity for a bare company list; the reminders pane passes tuples and
+    supplies a key that pulls out the (possibly None) company."""
+    by_score = mode in ("Highest Fit Score", "Lowest Fit Score")
+    by_reachout = mode in ("Most urgent first", "Least urgent first")
+    most_urgent = mode == "Most urgent first"
+    reverse = mode in ("Newest First", "Highest Fit Score")
+    items = list(items)
+    if by_score:
+        items.sort(key=lambda x: _score_sort_value(key(x), overrides), reverse=reverse)
+    elif by_reachout:
+        items.sort(key=lambda x: _reachout_sort_key(key(x), most_urgent))
+    else:
+        items.sort(key=lambda x: (key(x).added or "") if key(x) else "", reverse=reverse)
+    return items
+
+
 def _score_label(company: Company, overrides: dict[int, int]) -> str:
     """The fit score to display: a manual override (marked with *) if one is set,
     else the computed heuristic, or 'N/A' if there isn't enough data."""
@@ -345,6 +364,12 @@ class AffinityView(QWidget):
         for key, label in CATEGORY_DEFS:
             self.category_selector.addItem(label, key)
 
+        # dropdown picks the sort order of the list below (mirrors the reminders pane).
+        self.company_order = QComboBox()
+        self.company_order.setToolTip("Sort the company list")
+        self.company_order.addItems(REMINDERS_ORDER_OPTIONS)
+        self.company_order.setCurrentText(get_setting("pref.company_order", "Newest First"))
+
         self.company_list = QListWidget()
         self.company_list.setIconSize(LOGO_ICON_SIZE)
         _cfont = self.company_list.font()
@@ -361,6 +386,7 @@ class AffinityView(QWidget):
         ll.setContentsMargins(0, 0, 0, 0)
         ll.addWidget(self.search_box)
         ll.addWidget(self.category_selector)
+        ll.addWidget(self.company_order)
         ll.addWidget(self.company_list)
 
         # --- detail pane ---
@@ -526,6 +552,7 @@ class AffinityView(QWidget):
         self.detail_name.customContextMenuRequested.connect(self._detail_name_context_menu)
         self.company_list.currentRowChanged.connect(self._company_selected)
         self.category_selector.currentIndexChanged.connect(lambda _i: self._display_companies())
+        self.company_order.currentIndexChanged.connect(lambda _i: self._on_company_order_changed())
         self.pitchbook_btn.clicked.connect(self.open_pitchbook)
         self.raylu_btn.clicked.connect(self.open_raylu)
         self.website_btn.clicked.connect(self.open_website)
@@ -687,7 +714,9 @@ class AffinityView(QWidget):
     def _display_companies(self) -> None:
         """Show the currently-selected category in the single company list."""
         key = self.category_selector.currentData() or "all"
-        self._visible_companies = self._companies_for_category(key)
+        self._visible_companies = sort_companies(
+            self._companies_for_category(key),
+            self.company_order.currentText(), self._overrides)
         self._fill(self.company_list, self._visible_companies, self._overrides)
         self._start_logo_fetch()
 
@@ -858,10 +887,6 @@ class AffinityView(QWidget):
         """Populate the reminders pane for the selected custom watchlist (empty if none)."""
         list_id = self.list_selector.currentData()   # None = no custom list selected/exists
         mode = self.reminders_order.currentText()
-        by_score = mode in ("Highest Fit Score", "Lowest Fit Score")
-        by_reachout = mode in ("Most urgent first", "Least urgent first")
-        most_urgent = mode == "Most urgent first"
-        reverse = mode in ("Newest First", "Highest Fit Score")
 
         if list_id is None:
             self._reminders = []
@@ -870,23 +895,18 @@ class AffinityView(QWidget):
             status = "No lists yet — use “+” to create one."
         else:
             by_id = {c.id: c for c in self._companies}
-            # (company_id, Company|None, display name, sort key) per member
+            # (company_id, Company|None, display name) per member
             entries = []
             for cid, name in get_members(list_id):
                 c = by_id.get(cid)
-                entries.append((cid, c, c.name if c else name, (c.added or "") if c else ""))
-            if by_score:
-                entries.sort(key=lambda e: _score_sort_value(e[1], self._overrides), reverse=reverse)
-            elif by_reachout:
-                entries.sort(key=lambda e: _reachout_sort_key(e[1], most_urgent))
-            else:
-                entries.sort(key=lambda e: e[3], reverse=reverse)
+                entries.append((cid, c, c.name if c else name))
+            entries = sort_companies(entries, mode, self._overrides, key=lambda e: e[1])
             self._reminders = [e[1] for e in entries]
             self._reminder_ids = [e[0] for e in entries]
             rows = [f"{name}  ({_score_label(c, self._overrides) if c else 'N/A'})"
                     f"  ·  When to reach out: {reach_out_suggestion(c).date or '---'}" if c
                     else f"{name}  (N/A)  (not in current view)"
-                    for _cid, c, name, _key in entries]
+                    for _cid, c, name in entries]
             status = f"{len(entries)} in list" if entries else "Empty — use “Add to list”."
 
         self.reminders_list.blockSignals(True)
@@ -1332,6 +1352,10 @@ class AffinityView(QWidget):
     def _on_order_changed(self) -> None:
         set_setting("pref.reminders_order", self.reminders_order.currentText())
         self._build_reminders()
+
+    def _on_company_order_changed(self) -> None:
+        set_setting("pref.company_order", self.company_order.currentText())
+        self._display_companies()
 
     def reload_prefs(self) -> None:
         """Re-read the reminders order from settings (called after the Settings dialog closes)."""
