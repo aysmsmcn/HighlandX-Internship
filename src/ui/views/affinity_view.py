@@ -62,7 +62,21 @@ def _blank_date(d: str | None) -> str:
 
 REMINDERS_ORDER_OPTIONS = ["Newest First", "Oldest First",
                            "Highest Fit Score", "Lowest Fit Score",
-                           "Most urgent first", "Least urgent first"]
+                           "Most urgent first", "Least urgent first",
+                           "Longest Since Raised", "Most Recently Raised"]
+
+# Live "time since last raised" buckets shown in the reminders list dropdown. Membership
+# is computed on the fly from each company's last funding date, so a company moves between
+# buckets as time passes (unlike the user's hand-curated watchlists). Ranges are months,
+# [lo, hi); the final bucket is open-ended (hi = None). Keyed by str so the dropdown can
+# tell them apart from real lists (int ids).
+RAISED_BUCKETS = [
+    ("raised:0-6",   "Last raised 0–6 months ago",    0,  6),
+    ("raised:6-12",  "Last raised 6–12 months ago",   6,  12),
+    ("raised:12-18", "Last raised 12–18 months ago",  12, 18),
+    ("raised:18+",   "Last raised 18–24+ months ago", 18, None),
+]
+_RAISED_RANGE = {key: (lo, hi) for key, _label, lo, hi in RAISED_BUCKETS}
 
 LOGO_ICON_SIZE = QSize(28, 28)
 
@@ -121,6 +135,50 @@ def _reachout_sort_key(company: Company | None, most_urgent: bool) -> tuple[int,
     return (0, ordv if most_urgent else -ordv)
 
 
+def _days_since_raised(company: Company | None) -> int | None:
+    """Whole days between today and the company's last funding date (None if unknown)."""
+    d = company.last_funding_date if company else None
+    if not d:
+        return None
+    return (date.today() - date.fromisoformat(d[:10])).days
+
+
+def _last_raised_label(company: Company | None) -> str:
+    """Row annotation: 'Last raised YYYY-MM-DD' (or '—' when no funding date on file)."""
+    d = company.last_funding_date if company else None
+    return f"Last raised {d[:10]}" if d else "Last raised —"
+
+
+def _last_raised_sort_key(company: Company | None, longest_first: bool) -> tuple[int, int]:
+    """Sort key for time-since-last-raised. Companies with no funding date always sort
+    last, regardless of direction."""
+    days = _days_since_raised(company)
+    if days is None:
+        return (1, 0)                          # undated → always last
+    return (0, -days if longest_first else days)
+
+
+def _months_since_raised(company: Company | None) -> int | None:
+    """Whole calendar months between the last funding date and today (None if unknown)."""
+    d = company.last_funding_date if company else None
+    if not d:
+        return None
+    raised = date.fromisoformat(d[:10])
+    today = date.today()
+    months = (today.year - raised.year) * 12 + (today.month - raised.month)
+    if today.day < raised.day:                 # not a full month into the current one yet
+        months -= 1
+    return max(months, 0)
+
+
+def _in_raised_bucket(company: Company | None, lo: int, hi: int | None) -> bool:
+    """True if months-since-last-raised falls in [lo, hi) (hi None = open-ended)."""
+    m = _months_since_raised(company)
+    if m is None:
+        return False
+    return m >= lo and (hi is None or m < hi)
+
+
 def sort_companies(items, mode: str, overrides: dict[int, int], key=lambda c: c):
     """Order items by a REMINDERS_ORDER_OPTIONS mode (shared by the reminders pane
     and the main company list so both stay consistent). `key` maps each item to its
@@ -128,13 +186,17 @@ def sort_companies(items, mode: str, overrides: dict[int, int], key=lambda c: c)
     supplies a key that pulls out the (possibly None) company."""
     by_score = mode in ("Highest Fit Score", "Lowest Fit Score")
     by_reachout = mode in ("Most urgent first", "Least urgent first")
+    by_raised = mode in ("Longest Since Raised", "Most Recently Raised")
     most_urgent = mode == "Most urgent first"
+    longest_first = mode == "Longest Since Raised"
     reverse = mode in ("Newest First", "Highest Fit Score")
     items = list(items)
     if by_score:
         items.sort(key=lambda x: _score_sort_value(key(x), overrides), reverse=reverse)
     elif by_reachout:
         items.sort(key=lambda x: _reachout_sort_key(key(x), most_urgent))
+    elif by_raised:
+        items.sort(key=lambda x: _last_raised_sort_key(key(x), longest_first))
     else:
         items.sort(key=lambda x: (key(x).added or "") if key(x) else "", reverse=reverse)
     return items
@@ -540,7 +602,7 @@ class AffinityView(QWidget):
         self.reminders_order.currentIndexChanged.connect(lambda _i: self._on_order_changed())
         self.list_selector.currentIndexChanged.connect(lambda _i: self._build_reminders())
         self.list_selector.currentIndexChanged.connect(
-            lambda _i: self.del_list_btn.setEnabled(self.list_selector.currentData() is not None))
+            lambda _i: self.del_list_btn.setEnabled(isinstance(self.list_selector.currentData(), int)))
         self.add_list_btn.clicked.connect(self._create_list)
         self.del_list_btn.clicked.connect(self._delete_current_list)
         self.popout_btn.clicked.connect(self._toggle_popout)
@@ -729,7 +791,8 @@ class AffinityView(QWidget):
         widget.blockSignals(True)
         widget.clear()
         for c in companies:
-            item = QListWidgetItem(f"{c.name}  ({_score_label(c, overrides)})")
+            item = QListWidgetItem(
+                f"{c.name}  ({_score_label(c, overrides)})  ·  {_last_raised_label(c)}")
             item.setIcon(self._row_icon(c.domain))            # lazy disk icon (or blank if none)
             item.setData(Qt.ItemDataRole.UserRole, c.domain)   # delegate reads this for brand colors
             widget.addItem(item)
@@ -786,17 +849,22 @@ class AffinityView(QWidget):
         self.category_selector.blockSignals(False)
 
     def _refresh_list_selector(self) -> None:
-        """Populate the list dropdown with the user's custom watchlists (may be empty)."""
-        current = self.list_selector.currentData()   # remember selection (list_id or None)
+        """Populate the list dropdown: the live 'last raised' buckets first, then the
+        user's custom watchlists below a separator."""
+        current = self.list_selector.currentData()   # remember selection (bucket key | list_id)
         self.list_selector.blockSignals(True)
         self.list_selector.clear()
-        for lid, name in get_lists():
-            self.list_selector.addItem(name, lid)
+        for key, label, _lo, _hi in RAISED_BUCKETS:
+            self.list_selector.addItem(label, key)
+        lists = get_lists()
+        if lists:
+            self.list_selector.insertSeparator(self.list_selector.count())
+            for lid, name in lists:
+                self.list_selector.addItem(name, lid)
         idx = self.list_selector.findData(current)
-        self.list_selector.setCurrentIndex(
-            idx if idx >= 0 else (0 if self.list_selector.count() else -1))
+        self.list_selector.setCurrentIndex(idx if idx >= 0 else 0)   # default: first bucket
         self.list_selector.blockSignals(False)
-        self.del_list_btn.setEnabled(self.list_selector.currentData() is not None)
+        self.del_list_btn.setEnabled(isinstance(self.list_selector.currentData(), int))
 
     def _create_list(self) -> None:
         name, ok = QInputDialog.getText(self, "New list", "List name:")
@@ -836,7 +904,7 @@ class AffinityView(QWidget):
 
     def _delete_current_list(self) -> None:
         list_id = self.list_selector.currentData()
-        if list_id is None:                    # built-in list can't be deleted
+        if not isinstance(list_id, int):       # live buckets aren't real lists — can't delete
             return
         name = self.list_selector.currentText()
         reply = QMessageBox.question(
@@ -884,30 +952,37 @@ class AffinityView(QWidget):
         self._reminders_window = None
 
     def _build_reminders(self) -> None:
-        """Populate the reminders pane for the selected custom watchlist (empty if none)."""
-        list_id = self.list_selector.currentData()   # None = no custom list selected/exists
+        """Populate the reminders pane for the selected list: a live 'last raised' bucket
+        (str key) or a custom watchlist (int id)."""
+        sel = self.list_selector.currentData()   # None | str bucket key | int list_id
         mode = self.reminders_order.currentText()
 
-        if list_id is None:
-            self._reminders = []
-            self._reminder_ids = []
-            rows: list[str] = []
-            status = "No lists yet — use “+” to create one."
-        else:
+        # entries: (company_id, Company|None, display name) per row
+        if sel is None:
+            entries: list[tuple[int, Company | None, str]] = []
+            status = "No list selected."
+        elif isinstance(sel, str):                # live 'last raised' bucket
+            lo, hi = _RAISED_RANGE[sel]
+            entries = [(c.id, c, c.name) for c in self._companies
+                       if _in_raised_bucket(c, lo, hi)]
+            status = f"{len(entries)} companies" if entries else "No companies in this range."
+        else:                                     # custom watchlist (int id)
             by_id = {c.id: c for c in self._companies}
-            # (company_id, Company|None, display name) per member
             entries = []
-            for cid, name in get_members(list_id):
+            for cid, name in get_members(sel):
                 c = by_id.get(cid)
                 entries.append((cid, c, c.name if c else name))
-            entries = sort_companies(entries, mode, self._overrides, key=lambda e: e[1])
-            self._reminders = [e[1] for e in entries]
-            self._reminder_ids = [e[0] for e in entries]
-            rows = [f"{name}  ({_score_label(c, self._overrides) if c else 'N/A'})"
-                    f"  ·  When to reach out: {reach_out_suggestion(c).date or '---'}" if c
-                    else f"{name}  (N/A)  (not in current view)"
-                    for _cid, c, name in entries]
             status = f"{len(entries)} in list" if entries else "Empty — use “Add to list”."
+
+        entries = sort_companies(entries, mode, self._overrides, key=lambda e: e[1])
+        self._reminders = [e[1] for e in entries]
+        self._reminder_ids = [e[0] for e in entries]
+        rows = []
+        for _cid, c, name in entries:
+            if not c:
+                rows.append(f"{name}  (N/A)  (not in current view)")
+                continue
+            rows.append(f"{name}  ({_score_label(c, self._overrides)})  ·  {_last_raised_label(c)}")
 
         self.reminders_list.blockSignals(True)
         self.reminders_list.clear()
@@ -1170,7 +1245,7 @@ class AffinityView(QWidget):
     def _reminders_context_menu(self, pos) -> None:
         """Right-click a row in a custom list to remove that company from it."""
         list_id = self.list_selector.currentData()
-        if list_id is None:                    # built-in list is computed, not editable
+        if not isinstance(list_id, int):       # live buckets are computed, not editable
             return
         item = self.reminders_list.itemAt(pos)
         if item is None:
