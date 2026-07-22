@@ -11,7 +11,7 @@ from config import LOGOS_DIR
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QListWidget,
                                QListWidgetItem, QLabel, QSplitter, QTextBrowser, QLineEdit,
                                QComboBox, QApplication, QInputDialog, QMenu, QMessageBox,
-                               QFileDialog, QSpinBox)
+                               QFileDialog, QSpinBox, QDialog)
 from PySide6.QtCore import Qt, QUrl, QByteArray, QSize
 from PySide6.QtGui import (QShortcut, QKeySequence, QIcon, QPixmap, QColor, QPalette,
                            QFont)
@@ -189,6 +189,25 @@ def _months_since_raised(company: Company | None) -> int | None:
     if today.day < raised.day:                 # not a full month into the current one yet
         months -= 1
     return max(months, 0)
+
+
+def _months_since_date(iso: str | None) -> int | None:
+    """Whole calendar months between an ISO date and today (None if no date)."""
+    if not iso:
+        return None
+    d = date.fromisoformat(iso[:10])
+    today = date.today()
+    months = (today.year - d.year) * 12 + (today.month - d.month)
+    if today.day < d.day:
+        months -= 1
+    return max(months, 0)
+
+
+def _last_contact_iso(company: Company) -> str | None:
+    """Most recent past-contact date for a company (last email or last meeting)."""
+    dates = [it.date[:10] for it in (company.last_email, company.last_event)
+             if it and it.date]
+    return max(dates) if dates else None
 
 
 def _in_raised_bucket(company: Company | None, lo: int, hi: int | None) -> bool:
@@ -928,20 +947,49 @@ class AffinityView(QWidget):
             return
 
         list_name = self.list_selector.currentText() or "this list"
-        detail = (f"\n\n({skipped} in the list have no loaded entry and will be skipped.)"
-                  if skipped else "")
-        reply = QMessageBox.warning(
-            self, "Pass All",
-            f"Set ALL {len(companies)} companies in “{list_name}” to “Passed” in Affinity?\n\n"
-            "This changes shared CRM data for your whole team and can't be easily undone."
-            + detail,
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
-            QMessageBox.StandardButton.Cancel)
-        if reply != QMessageBox.StandardButton.Yes:
+        months = int(get_setting("pref.pass_recent_contact_months", "3"))
+
+        # Failsafes: never pass Portfolio companies; flag recently-contacted ones for review.
+        portfolio = [c for c in companies if (c.status or "").strip().lower() == "portfolio"]
+        candidates = [c for c in companies if c not in portfolio]
+        recent: list[tuple[Company, str]] = []   # (company, last-contact date)
+        safe: list[Company] = []
+        for c in candidates:
+            iso = _last_contact_iso(c)
+            m = _months_since_date(iso)
+            if m is not None and m < months:
+                recent.append((c, iso))
+            else:
+                safe.append(c)
+
+        if recent:
+            chosen = self._review_recent_contacts(list_name, safe, recent, portfolio, months)
+            if chosen is None:                    # cancelled
+                return
+            to_pass = safe + chosen
+        else:
+            note = ""
+            if portfolio:
+                note += f"\n\n({len(portfolio)} portfolio companies will NOT be passed.)"
+            if skipped:
+                note += f"\n({skipped} with no loaded entry will be skipped.)"
+            reply = QMessageBox.warning(
+                self, "Pass All",
+                f"Set {len(safe)} companies in “{list_name}” to “Passed” in Affinity?\n\n"
+                "This changes shared CRM data for your whole team and can't be easily undone."
+                + note,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel)
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            to_pass = safe
+
+        if not to_pass:
+            QMessageBox.information(self, "Pass All", "No companies selected to pass.")
             return
 
         self.update_affinity_btn.setEnabled(False)
-        self.status.setText(f"Passing {len(companies)} companies in Affinity…")
+        self.status.setText(f"Passing {len(to_pass)} companies in Affinity…")
         sem = asyncio.Semaphore(8)
         failed = 0
 
@@ -953,13 +1001,61 @@ class AffinityView(QWidget):
                 except Exception:
                     failed += 1
 
-        await asyncio.gather(*(_one(c) for c in companies))
-        done = len(companies) - failed
+        await asyncio.gather(*(_one(c) for c in to_pass))
+        done = len(to_pass) - failed
+        kept = len(portfolio) + (len(recent) - (len(to_pass) - len(safe)))
         self.status.setText(
-            f"Passed {done} companies" + (f" · {failed} failed" if failed else "") + ".")
+            f"Passed {done} companies"
+            + (f" · {failed} failed" if failed else "")
+            + (f" · {kept} kept" if kept else "") + ".")
         self.update_affinity_btn.setEnabled(True)
         if done:
             self.load()          # refresh — passed companies drop out of the active view
+
+    def _review_recent_contacts(self, list_name, safe, recent, portfolio, months):
+        """Warn about recently-contacted companies before passing. Returns the list of
+        recently-contacted companies the user chose to pass anyway, or None if cancelled."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Pass All — review recent contacts")
+        dlg.resize(460, 460)
+        lay = QVBoxLayout(dlg)
+        summary = (f"Passing companies in “{list_name}”.\n\n"
+                   f"{len(safe)} will be passed automatically.\n"
+                   f"{len(recent)} were contacted within {months} month(s) — "
+                   "check any you still want to pass (unchecked stays untouched).")
+        if portfolio:
+            summary += f"\n{len(portfolio)} portfolio companies will NOT be passed."
+        summary_lbl = QLabel(summary)
+        summary_lbl.setWordWrap(True)
+        lay.addWidget(summary_lbl)
+
+        review = QListWidget()
+        for c, iso in recent:
+            item = QListWidgetItem(f"{c.name}  ·  last contact {iso}")
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Unchecked)     # protect recent contacts by default
+            item.setData(Qt.ItemDataRole.UserRole, c)
+            review.addItem(item)
+        lay.addWidget(review, 1)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(dlg.reject)
+        proceed_btn = QPushButton("Proceed with Passing")
+        proceed_btn.clicked.connect(dlg.accept)
+        buttons.addWidget(cancel_btn)
+        buttons.addWidget(proceed_btn)
+        lay.addLayout(buttons)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return None
+        chosen = []
+        for i in range(review.count()):
+            it = review.item(i)
+            if it.checkState() == Qt.CheckState.Checked:
+                chosen.append(it.data(Qt.ItemDataRole.UserRole))
+        return chosen
 
     def _fill(self, widget: QListWidget, companies: list[Company],
              overrides: dict[int, int]) -> None:

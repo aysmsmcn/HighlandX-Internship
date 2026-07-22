@@ -161,7 +161,21 @@ class SettingsDialog(QDialog):
 
         self.threshold_status = QLabel("")
         form.addRow("", self.threshold_status)
+
+        # --- Pass All safeguard: flag companies contacted within this many months ---
+        self.recent_months_spin = QSpinBox()
+        self.recent_months_spin.setRange(0, 60)
+        self.recent_months_spin.setValue(
+            int(get_setting("pref.pass_recent_contact_months", "3")))
+        self.recent_months_spin.setToolTip(
+            "“Pass All” flags companies contacted within this many months for review "
+            "before passing them.")
+        self.recent_months_spin.valueChanged.connect(self._save_recent_months)
+        form.addRow("Pass All — recent contact (months):", self.recent_months_spin)
         return box
+
+    def _save_recent_months(self, value: int) -> None:
+        set_setting("pref.pass_recent_contact_months", str(value))
 
     def _save_order(self, text: str) -> None:
         set_setting("pref.reminders_order", text)
