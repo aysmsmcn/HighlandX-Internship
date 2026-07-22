@@ -62,9 +62,13 @@ class MainWindow(QMainWindow):
         set_setting("pref.gradient", "on" if on else "off")
 
     def open_settings(self) -> None:
-        dlg = SettingsDialog(self)
-        dlg.exec()
-        self.view.reload_prefs()
+        # non-modal (like Events) so the async "Authorize Raylu" OAuth flow isn't
+        # starved by a modal exec() loop; reload prefs when the dialog closes.
+        self._settings_dialog = SettingsDialog(self)
+        self._settings_dialog.finished.connect(lambda _r: self.view.reload_prefs())
+        self._settings_dialog.show()
+        self._settings_dialog.raise_()
+        self._settings_dialog.activateWindow()
 
     def open_events(self) -> None:
         # non-modal (unlike Settings) so clicking an event can select the company live

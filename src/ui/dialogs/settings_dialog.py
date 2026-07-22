@@ -2,10 +2,13 @@ from PySide6.QtWidgets import (QDialog, QVBoxLayout, QGroupBox, QFormLayout,
                                QLineEdit, QPushButton, QComboBox, QLabel,
                                QSpinBox, QDialogButtonBox)
 
+from qasync import asyncSlot
+
 from services.settings_service import get_setting, set_setting
-from auth.secrets import set_secret, get_secret, AFFINITY_API_KEY
+from auth.secrets import (set_secret, get_secret, AFFINITY_API_KEY,
+                          ANTHROPIC_API_KEY, RAYLU_MCP_URL, RAYLU_OAUTH_TOKENS)
 from auth import ms_auth
-from services import affinity_service
+from services import affinity_service, raylu_service
 from ui.views.affinity_view import REMINDERS_ORDER_OPTIONS
 
 
@@ -44,6 +47,32 @@ class SettingsDialog(QDialog):
         form.addRow("", save_key_btn)
         form.addRow("", self.key_status)
 
+        # --- Anthropic API key (drives Raylu enrichment via Haiku 4.5) ---
+        self.anthropic_field = QLineEdit()
+        self.anthropic_field.setEchoMode(QLineEdit.EchoMode.Password)
+        self.anthropic_field.setPlaceholderText(
+            "•••• already set" if get_secret(ANTHROPIC_API_KEY) else "paste Anthropic API key")
+        anthropic_btn = QPushButton("Save")
+        anthropic_btn.clicked.connect(self._save_anthropic)
+        self.anthropic_status = QLabel("")
+        form.addRow("Anthropic API key:", self.anthropic_field)
+        form.addRow("", anthropic_btn)
+        form.addRow("", self.anthropic_status)
+
+        # --- Raylu MCP endpoint + one-time OAuth authorize ---
+        self.raylu_url_field = QLineEdit(get_secret(RAYLU_MCP_URL) or "")
+        self.raylu_url_field.setPlaceholderText("https://…/mcp")
+        save_url_btn = QPushButton("Save URL")
+        save_url_btn.clicked.connect(self._save_raylu_url)
+        self.authorize_btn = QPushButton(
+            "Re-authorize Raylu" if get_secret(RAYLU_OAUTH_TOKENS) else "Authorize Raylu")
+        self.authorize_btn.clicked.connect(self._authorize_raylu)
+        self.raylu_status = QLabel("")
+        form.addRow("Raylu MCP URL:", self.raylu_url_field)
+        form.addRow("", save_url_btn)
+        form.addRow("Raylu access:", self.authorize_btn)
+        form.addRow("", self.raylu_status)
+
         # --- Microsoft sign-out ---
         signout_btn = QPushButton("Sign out of Microsoft")
         signout_btn.clicked.connect(self._sign_out)
@@ -52,6 +81,42 @@ class SettingsDialog(QDialog):
         form.addRow("", self.signout_status)
 
         return box
+
+    def _save_anthropic(self) -> None:
+        text = self.anthropic_field.text().strip()
+        if not text:
+            self.anthropic_status.setText("Enter a key first.")
+            return
+        set_secret(ANTHROPIC_API_KEY, text)
+        self.anthropic_field.clear()
+        self.anthropic_status.setText("Saved ✓")
+
+    def _save_raylu_url(self) -> None:
+        url = self.raylu_url_field.text().strip()
+        if not url:
+            self.raylu_status.setText("Enter the MCP URL first.")
+            return
+        set_secret(RAYLU_MCP_URL, url)
+        self.raylu_status.setText("URL saved ✓")
+
+    @asyncSlot()
+    async def _authorize_raylu(self) -> None:
+        url = self.raylu_url_field.text().strip() or get_secret(RAYLU_MCP_URL)
+        if not url:
+            self.raylu_status.setText("Save the MCP URL first.")
+            return
+        set_secret(RAYLU_MCP_URL, url)             # persist any freshly typed URL
+        self.authorize_btn.setEnabled(False)
+        self.raylu_status.setText("Opening your browser — approve access, then come back…")
+        try:
+            await raylu_service.authorize()
+        except Exception as e:
+            self.raylu_status.setText(f"Authorization failed: {e}")
+        else:
+            self.raylu_status.setText("Authorized ✓")
+            self.authorize_btn.setText("Re-authorize Raylu")
+        finally:
+            self.authorize_btn.setEnabled(True)
 
     def _save_key(self) -> None:
         text = self.key_field.text().strip()

@@ -43,6 +43,16 @@ class ListMember(Base):
     company_name: Mapped[str]
 
 
+class LocalNote(Base):
+    """A note stored only on this machine — never sent to Affinity."""
+    __tablename__ = "local_note"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    company_id: Mapped[int]             # Affinity organization id
+    content: Mapped[str]
+    created_at: Mapped[str]             # ISO-8601 timestamp
+
+
 class FitOverride(Base):
     """A manually-set fit score that overrides the computed heuristic for a company."""
     __tablename__ = "fit_override"

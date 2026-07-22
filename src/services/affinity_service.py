@@ -34,6 +34,8 @@ STAGE_FIELD_ID = "affinity-data-investment-stage"              # enriched: e.g. 
 EMPLOYEES_FIELD_ID = "affinity-data-employees-current"                    # enriched: headcount
 EMPLOYEES_GROWTH_FIELD_ID = "affinity-data-employees-growth-yoy-percentage"  # enriched: YoY headcount growth %
 HIRES_3MO_FIELD_ID = "affinity-data-employee-hires-last-3-months-percentage"  # enriched: hires last 3mo, % of headcount
+LINKEDIN_URL_FIELD_ID = "affinity-data-linkedin-url"          # enriched: company LinkedIn page URL
+YEAR_FOUNDED_FIELD_ID = "affinity-data-year-founded"          # enriched: founding year (number)
 
 # Only show deals at these early stages (matched case-insensitively):
 ALLOWED_STATUSES = {"new companies", "reached out", "tracking"}
@@ -44,6 +46,7 @@ STATUS_OPTION_IDS = {
     "reached out": 4372360,
     "tracking": 4372367,
 }
+PASSED_OPTION_ID = 4372366             # the "Passed" option on the Status ranked-dropdown
 
 # Reach-out heuristic: typical months between rounds by stage (rough industry
 # averages), minus a lead time so the suggestion lands before the next round.
@@ -150,6 +153,9 @@ class Company:
     employees_current: int | None = None      # current headcount
     employees_growth_yoy: float | None = None  # YoY headcount growth, %
     hires_3mo_pct: float | None = None         # hires in last 3 months, % of headcount
+    linkedin_url: str | None = None            # company LinkedIn page (Affinity enrichment)
+    year_founded: int | None = None            # founding year (Affinity enrichment)
+    list_entry_id: int | None = None           # this company's entry id on the Deals list (for writes)
 
 
 @dataclass
@@ -159,6 +165,7 @@ class Note:
     created_at: str
     creator_id: int | None = None
     is_meeting: bool = False
+    local: bool = False        # True = stored only in this app, not shared to Affinity
 
 
 @dataclass
@@ -224,6 +231,14 @@ async def get_company_notes(company_id: int) -> list[Note]:
         )
         for n in raw
     ]
+
+
+async def create_note(company_id: int, content: str) -> None:
+    """Write a note attached to a company (Affinity v1 POST /notes)."""
+    async with httpx.AsyncClient(base_url=AFFINITY_BASE, auth=_basic_auth(), timeout=30) as client:
+        resp = await client.post(
+            "/notes", json={"content": content, "organization_ids": [company_id]})
+        resp.raise_for_status()
 
 
 async def company_has_notes(company_id: int) -> bool:
@@ -626,6 +641,9 @@ def _entity_to_company(entry: dict) -> Company:
         employees_current=_enriched_scalar(entry, EMPLOYEES_FIELD_ID),
         employees_growth_yoy=_enriched_scalar(entry, EMPLOYEES_GROWTH_FIELD_ID),
         hires_3mo_pct=_enriched_scalar(entry, HIRES_3MO_FIELD_ID),
+        linkedin_url=_enriched_scalar(entry, LINKEDIN_URL_FIELD_ID),
+        year_founded=_enriched_scalar(entry, YEAR_FOUNDED_FIELD_ID),
+        list_entry_id=entry.get("id"),         # the list-entry id (distinct from the company id)
     )
 
 
@@ -659,6 +677,9 @@ def companies_from_json(text: str) -> list[Company]:
             employees_current=d.get("employees_current"),
             employees_growth_yoy=d.get("employees_growth_yoy"),
             hires_3mo_pct=d.get("hires_3mo_pct"),
+            linkedin_url=d.get("linkedin_url"),
+            year_founded=d.get("year_founded"),
+            list_entry_id=d.get("list_entry_id"),
         ))
     return out
 
@@ -677,7 +698,8 @@ async def list_my_companies(my_pid: int) -> list[Company]:
                           FUNDING_DATE_FIELD_ID, FUNDING_AMOUNT_FIELD_ID,
                           TOTAL_FUNDING_FIELD_ID, STAGE_FIELD_ID,
                           EMPLOYEES_FIELD_ID, EMPLOYEES_GROWTH_FIELD_ID,
-                          HIRES_3MO_FIELD_ID])
+                          HIRES_3MO_FIELD_ID, LINKEDIN_URL_FIELD_ID,
+                          YEAR_FOUNDED_FIELD_ID])
     option_ids = [STATUS_OPTION_IDS[s] for s in ALLOWED_STATUSES if s in STATUS_OPTION_IDS]
     body = {
         "filters": {"operator": "and", "filters": [
@@ -703,3 +725,18 @@ async def list_my_companies(my_pid: int) -> list[Company]:
             url = (payload.get("pagination") or {}).get("nextUrl")
             params = None      # nextUrl already carries fieldIds + cursor
     return out
+
+
+async def pass_company(list_entry_id: int) -> None:
+    """Set a Deals list entry's Status to "Passed" (Affinity v2 single-field update).
+
+    POST /v2/lists/{list}/list-entries/{entry}/fields/{field} with the ranked-dropdown
+    value. Writes shared CRM data — callers gate this behind a confirmation.
+    """
+    url = (f"{AFFINITY_V2_BASE}/lists/{DEALS_LIST_ID}/list-entries/{list_entry_id}"
+           f"/fields/{STATUS_FIELD_ID}")
+    body = {"value": {"type": "ranked-dropdown",
+                      "data": {"dropdownOptionId": PASSED_OPTION_ID}}}
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(url, json=body, headers=_bearer_headers())
+        resp.raise_for_status()
