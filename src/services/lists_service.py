@@ -27,6 +27,24 @@ def create_list(name: str) -> int:
         return row.id
 
 
+def rename_list(list_id: int, new_name: str) -> bool:
+    """Rename a list. Returns False if new_name is blank, the list is gone, or another list
+    already has that name (names are unique); True on success."""
+    new_name = new_name.strip()
+    if not new_name:
+        return False
+    with SessionLocal() as s:
+        clash = s.query(CompanyList).filter_by(name=new_name).one_or_none()
+        if clash is not None and clash.id != list_id:
+            return False                       # name taken by a different list
+        row = s.get(CompanyList, list_id)
+        if row is None:
+            return False
+        row.name = new_name
+        s.commit()
+        return True
+
+
 def delete_list(list_id: int) -> None:
     """Delete a list and all of its members."""
     with SessionLocal() as s:

@@ -8,6 +8,7 @@ Service layer — wraps httpx. The UI talks to THIS, never to httpx directly.
 The API key comes from keyring (auth.secrets), never from source/config.
 """
 
+import asyncio
 import json
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta
@@ -159,6 +160,14 @@ class Company:
 
 
 @dataclass
+class Owner:
+    """A person who owns at least one (non-Passed) deal on the Deals list.
+    `id` is the Affinity person id used to filter the Owners field."""
+    id: int
+    name: str
+
+
+@dataclass
 class Note:
     id: int
     content: str              # may contain HTML / Markdown
@@ -197,13 +206,60 @@ def _bearer_headers() -> dict:
     return {"Authorization": f"Bearer {key}"}
 
 
+# --- rate-limit / quota handling --------------------------------------------
+
+class AffinityQuotaExhausted(RuntimeError):
+    """The ORG-wide monthly Affinity API quota is spent — a 429 whose response says
+    `x-ratelimit-limit-org-remaining: 0`. This is different from a transient per-user
+    rate limit: it won't clear until the tenant's monthly allotment resets, so callers
+    should fail FAST (no back-off/retry) and tell the user when it comes back."""
+
+    def __init__(self, reset_seconds: int | None = None):
+        self.reset_seconds = reset_seconds
+        super().__init__(self._message())
+
+    def _message(self) -> str:
+        if not self.reset_seconds:
+            return ("Affinity's org-wide monthly API quota is used up. No calls will "
+                    "succeed until it resets (typically the 1st of the month).")
+        days = self.reset_seconds / 86400
+        return (f"Affinity's org-wide monthly API quota is used up — it resets in "
+                f"~{days:.1f} days. No Affinity calls will succeed until then. "
+                f"(This is the whole tenant's 100k-calls/month budget, shared across "
+                f"all users and integrations, not your personal limit.)")
+
+
+def _org_quota_exhausted(resp) -> "AffinityQuotaExhausted | None":
+    """Return a ready-to-raise AffinityQuotaExhausted if `resp` is an org-quota 429,
+    else None. Distinguishes the monthly-quota wall from an ordinary per-user 429 by
+    reading the org-remaining header."""
+    if resp.status_code != 429:
+        return None
+    if (resp.headers.get("x-ratelimit-limit-org-remaining") or "").strip() != "0":
+        return None      # a 429 but NOT the org quota → a normal (retryable) rate limit
+    try:
+        reset_s = int(resp.headers.get("x-ratelimit-limit-org-reset"))
+    except (TypeError, ValueError):
+        reset_s = None
+    return AffinityQuotaExhausted(reset_s)
+
+
+def _raise_for_status(resp) -> None:
+    """Drop-in for resp.raise_for_status() that first converts an org-quota 429 into a
+    clear AffinityQuotaExhausted, so the UI shows an honest 'resets in N days' message."""
+    exc = _org_quota_exhausted(resp)
+    if exc is not None:
+        raise exc
+    resp.raise_for_status()
+
+
 # --- v1 lookups -------------------------------------------------------------
 
 async def whoami() -> dict:
     """Confirm the key works and identify the current user."""
     async with httpx.AsyncClient(base_url=AFFINITY_BASE, auth=_basic_auth(), timeout=30) as client:
         resp = await client.get("/auth/whoami")
-        resp.raise_for_status()
+        _raise_for_status(resp)
         return resp.json()
 
 
@@ -217,7 +273,7 @@ async def get_company_notes(company_id: int) -> list[Note]:
     """Notes attached to a company (Affinity v1 /notes?organization_id=...)."""
     async with httpx.AsyncClient(base_url=AFFINITY_BASE, auth=_basic_auth(), timeout=30) as client:
         resp = await client.get("/notes", params={"organization_id": company_id})
-        resp.raise_for_status()
+        _raise_for_status(resp)
         data = resp.json()
 
     raw = data if isinstance(data, list) else data.get("notes", [])
@@ -238,17 +294,7 @@ async def create_note(company_id: int, content: str) -> None:
     async with httpx.AsyncClient(base_url=AFFINITY_BASE, auth=_basic_auth(), timeout=30) as client:
         resp = await client.post(
             "/notes", json={"content": content, "organization_ids": [company_id]})
-        resp.raise_for_status()
-
-
-async def company_has_notes(company_id: int) -> bool:
-    """True if a company has at least one note (cheap — fetches a single note)."""
-    async with httpx.AsyncClient(base_url=AFFINITY_BASE, auth=_basic_auth(), timeout=30) as client:
-        resp = await client.get("/notes", params={"organization_id": company_id, "page_size": 1})
-        resp.raise_for_status()
-        data = resp.json()
-        notes = data if isinstance(data, list) else data.get("notes", [])
-        return len(notes) > 0
+        _raise_for_status(resp)
 
 
 async def get_company_summary(company_id: int) -> CompanySummary:
@@ -256,7 +302,7 @@ async def get_company_summary(company_id: int) -> CompanySummary:
     async with httpx.AsyncClient(base_url=AFFINITY_BASE, auth=_basic_auth(), timeout=30) as client:
         resp = await client.get(f"/organizations/{company_id}",
                                 params={"with_interaction_dates": "true"})
-        resp.raise_for_status()
+        _raise_for_status(resp)
         d = (resp.json() or {}).get("interaction_dates", {}) or {}
 
     return CompanySummary(
@@ -649,6 +695,26 @@ def _entity_to_company(entry: dict) -> Company:
 
 # --- (de)serialization for the local cache ----------------------------------
 
+def notes_to_json(notes: list[Note]) -> str:
+    """Serialize Affinity notes to a JSON string (for the per-company notes cache)."""
+    return json.dumps([asdict(n) for n in notes])
+
+
+def notes_from_json(text: str) -> list[Note]:
+    """Rebuild notes from a JSON string produced by notes_to_json."""
+    return [
+        Note(
+            id=d.get("id"),
+            content=d.get("content", "") or "",
+            created_at=d.get("created_at", "") or "",
+            creator_id=d.get("creator_id"),
+            is_meeting=d.get("is_meeting", False),
+            local=d.get("local", False),
+        )
+        for d in json.loads(text)
+    ]
+
+
 def companies_to_json(companies: list[Company]) -> str:
     """Serialize companies (with their nested Interactions) to a JSON string."""
     return json.dumps([asdict(c) for c in companies])
@@ -684,11 +750,12 @@ def companies_from_json(text: str) -> list[Company]:
     return out
 
 
-async def list_my_companies(my_pid: int) -> list[Company]:
-    """Deals owned by my_pid whose Status is one of ALLOWED_STATUSES.
+async def list_my_companies(my_pid: int, status_option_ids: "list[int] | None" = None) -> list[Company]:
+    """Deals owned by my_pid whose Status is one of the given option ids (defaults to
+    ALLOWED_STATUSES — the active early stages).
 
     Uses the v2 filtered-search endpoint so Affinity applies the Owners + Status
-    filters server-side: we fetch only the ~4k matching entries instead of paging
+    filters server-side: we fetch only the matching entries instead of paging
     the entire ~23k-row Deals list and filtering client-side (~10x faster).
     Note: this endpoint is POST-only (its nextUrl rejects GET), and the nextUrl
     carries the fieldIds + cursor, so later pages re-POST to it with the same body.
@@ -700,14 +767,16 @@ async def list_my_companies(my_pid: int) -> list[Company]:
                           EMPLOYEES_FIELD_ID, EMPLOYEES_GROWTH_FIELD_ID,
                           HIRES_3MO_FIELD_ID, LINKEDIN_URL_FIELD_ID,
                           YEAR_FOUNDED_FIELD_ID])
-    option_ids = [STATUS_OPTION_IDS[s] for s in ALLOWED_STATUSES if s in STATUS_OPTION_IDS]
+    if status_option_ids is None:
+        status_option_ids = [STATUS_OPTION_IDS[s] for s in ALLOWED_STATUSES
+                             if s in STATUS_OPTION_IDS]
     body = {
         "filters": {"operator": "and", "filters": [
             {"fieldId": OWNERS_FIELD_ID, "valueType": "person-multi",
              "operator": "has-any-of", "value": [{"id": my_pid}]},
             {"fieldId": STATUS_FIELD_ID, "valueType": "ranked-dropdown",
              "operator": "is-any-of",
-             "value": [{"dropdownOptionId": oid} for oid in option_ids]},
+             "value": [{"dropdownOptionId": oid} for oid in status_option_ids]},
         ]},
     }
     out: list[Company] = []
@@ -716,7 +785,7 @@ async def list_my_companies(my_pid: int) -> list[Company]:
         params = {"fieldIds": field_ids, "limit": 100}
         while url:
             resp = await client.post(url, params=params, json=body, headers=_bearer_headers())
-            resp.raise_for_status()
+            _raise_for_status(resp)
             payload = resp.json()
 
             for entry in payload.get("data", []):
@@ -727,16 +796,210 @@ async def list_my_companies(my_pid: int) -> list[Company]:
     return out
 
 
-async def pass_company(list_entry_id: int) -> None:
-    """Set a Deals list entry's Status to "Passed" (Affinity v2 single-field update).
+async def list_passed_companies(my_pid: int) -> list[Company]:
+    """Deals owned by my_pid whose Status is "Passed" (for the separate "Passed" filter)."""
+    return await list_my_companies(my_pid, status_option_ids=[PASSED_OPTION_ID])
 
-    POST /v2/lists/{list}/list-entries/{entry}/fields/{field} with the ranked-dropdown
-    value. Writes shared CRM data — callers gate this behind a confirmation.
+
+def _owner_persons(entry: dict) -> list[tuple[int, str]]:
+    """Pull the (id, name) of each person in the Owners person-multi field off a v2 entry."""
+    ent = entry.get("entity") or {}
+    for field in ent.get("fields", []):
+        if field.get("id") != OWNERS_FIELD_ID:
+            continue
+        data = (field.get("value") or {}).get("data")
+        items = data if isinstance(data, list) else ([data] if isinstance(data, dict) else [])
+        out: list[tuple[int, str]] = []
+        for p in items:
+            if not isinstance(p, dict) or p.get("id") is None:
+                continue
+            fallback = p.get("primaryEmailAddress") or p.get("emailAddress") or str(p["id"])
+            out.append((p["id"], _person_name(p, fallback)))
+        return out
+    return []
+
+
+async def _request_with_retry(send, attempts: int = 6):
+    """Run an async request thunk (a no-arg callable returning an httpx.Response), backing off
+    on a per-user 429 but failing FAST if the org monthly quota is exhausted (retry can't help).
+    Method-agnostic so both GET and POST (filtered search) paths can share it."""
+    delay = 2.0
+    for i in range(attempts):
+        resp = await send()
+        exc = _org_quota_exhausted(resp)
+        if exc is not None:
+            raise exc                       # monthly quota gone — don't waste attempts
+        if resp.status_code != 429 or i == attempts - 1:
+            _raise_for_status(resp)
+            return resp
+        await asyncio.sleep(delay)
+        delay = min(delay * 2, 30)
+
+
+# Owner-discovery batching. Discovery now filters server-side to ACTIVE statuses (see below),
+# so it pages only the active subset — but that can still be several thousand rows. To stay
+# under the rate limit it scans in BATCHES of DISCOVER_BATCH_ROWS rows, then pauses
+# DISCOVER_BATCH_PAUSE_SECONDS so Affinity's per-minute budget can refill. Per-request 429
+# back-off still applies inside a batch as a safety net. All tunable.
+DISCOVER_PAGE_LIMIT = 100            # rows per request (Affinity v2's max page size)
+DISCOVER_BATCH_ROWS = 6000           # rows per batch before pausing
+DISCOVER_BATCH_PAUSE_SECONDS = 20    # pause between batches to let the rate limit recover
+
+
+async def discover_owners(progress=None) -> list[Owner]:
+    """Collect every distinct Owner of an ACTIVE deal (Status in ALLOWED_STATUSES) on the Deals
+    list, returned sorted by name.
+
+    Uses the v2 filtered-search endpoint (like list_my_companies) so Affinity applies the Status
+    filter SERVER-SIDE — we only receive active-status rows instead of paging the whole ~23k-row
+    list. Passed (and any other non-active status) is excluded before it's ever sent, which cuts
+    the number of pages/calls sharply. This also aligns the dropdown with what the app can load:
+    an owner appears only if they own a deal in a status list_my_companies would actually return.
+
+    Search-endpoint quirks (same as list_my_companies): it's POST-only, and its nextUrl carries
+    the fieldIds + cursor, so later pages re-POST to nextUrl with the same body. Still batches
+    and backs off on 429s.
+
+    progress: optional callback(rows_scanned: int, owners_found: int) invoked after each page.
     """
-    url = (f"{AFFINITY_V2_BASE}/lists/{DEALS_LIST_ID}/list-entries/{list_entry_id}"
-           f"/fields/{STATUS_FIELD_ID}")
-    body = {"value": {"type": "ranked-dropdown",
-                      "data": {"dropdownOptionId": PASSED_OPTION_ID}}}
+    option_ids = [STATUS_OPTION_IDS[s] for s in ALLOWED_STATUSES if s in STATUS_OPTION_IDS]
+    body = {
+        "filters": {"operator": "and", "filters": [
+            {"fieldId": STATUS_FIELD_ID, "valueType": "ranked-dropdown",
+             "operator": "is-any-of",
+             "value": [{"dropdownOptionId": oid} for oid in option_ids]},
+        ]},
+    }
+    owners: dict[int, str] = {}
+    scanned = 0
+    rows_since_pause = 0
+    async with httpx.AsyncClient(timeout=60) as client:
+        url = f"{AFFINITY_V2_BASE}/lists/{DEALS_LIST_ID}/list-entries/search"
+        params = {"fieldIds": OWNERS_FIELD_ID, "limit": DISCOVER_PAGE_LIMIT}
+        while url:
+            resp = await _request_with_retry(
+                lambda u=url, p=params: client.post(u, params=p, json=body, headers=_bearer_headers()))
+            payload = resp.json()
+            rows = payload.get("data", [])
+            for entry in rows:
+                for pid, name in _owner_persons(entry):
+                    owners[pid] = name
+            scanned += len(rows)
+            rows_since_pause += len(rows)
+            if progress:
+                progress(scanned, len(owners))
+
+            url = (payload.get("pagination") or {}).get("nextUrl")
+            params = None      # nextUrl (POST-only) already carries fieldIds + cursor
+
+            # Batch boundary: pause before the next batch so the rate budget can refill.
+            if url and rows_since_pause >= DISCOVER_BATCH_ROWS:
+                rows_since_pause = 0
+                await asyncio.sleep(DISCOVER_BATCH_PAUSE_SECONDS)
+    return sorted((Owner(id=i, name=n) for i, n in owners.items()),
+                  key=lambda o: o.name.lower())
+
+
+def owners_to_json(owners: list[Owner]) -> str:
+    return json.dumps([asdict(o) for o in owners])
+
+
+def owners_from_json(text: str) -> list[Owner]:
+    return [Owner(id=d["id"], name=d["name"]) for d in json.loads(text)]
+
+
+# Substring (case-insensitive) used to locate the "Pass Reason" dropdown field by name on the
+# Deals list, since its field id isn't known ahead of time (discovered at runtime, then cached).
+PASS_REASON_FIELD_MATCH = "reason"
+
+
+async def get_pass_reasons() -> "dict | None":
+    """Discover the Deals list's pass-reason dropdown field and its selectable options.
+
+    Uses the v1 fields endpoint (GET /fields?list_id=...) because it returns dropdown options
+    inline (`dropdown_options`), whereas the v2 fields endpoint omits them. Picks the field
+    whose name best matches a pass reason (prefers one containing both "pass" and "reason").
+    Returns {"field_id", "value_type", "options": [{"id", "text"}, ...]} or None if not found.
+
+    field_id is returned in the v2 form ("field-<n>") since writes go through the v2 endpoint;
+    value_type is "dropdown-multi" for a multi-select field (Highland's Pass Reason is), else
+    "dropdown" — this drives the write shape in set_status.
+    """
+    async with httpx.AsyncClient(base_url=AFFINITY_BASE, auth=_basic_auth(), timeout=30) as client:
+        resp = await client.get("/fields", params={"list_id": DEALS_LIST_ID})
+        _raise_for_status(resp)
+        payload = resp.json()
+    fields = payload if isinstance(payload, list) else payload.get("fields", [])
+
+    def _score(name: str) -> int:
+        n = (name or "").lower()
+        if "pass" in n and "reason" in n:
+            return 2
+        return 1 if PASS_REASON_FIELD_MATCH in n else 0
+
+    best, best_score = None, 0
+    for f in fields:
+        if not isinstance(f, dict):
+            continue
+        s = _score(f.get("name", ""))
+        if s > best_score:
+            best, best_score = f, s
+    if best is None:
+        return None
+
+    options = [{"id": o["id"], "text": o.get("text", "")}
+               for o in (best.get("dropdown_options") or [])
+               if isinstance(o, dict) and o.get("id") is not None]
+    return {"field_id": f"field-{best['id']}",              # v2 write id form
+            "value_type": "dropdown-multi" if best.get("allows_multiple") else "dropdown",
+            "options": options}
+
+
+async def get_statuses() -> list[dict]:
+    """The Status ranked-dropdown's options as [{"id", "text"}], ordered by Affinity rank.
+
+    Uses the v1 fields endpoint (returns dropdown_options inline). Matches the Status field by
+    its known id, falling back to a name match."""
+    async with httpx.AsyncClient(base_url=AFFINITY_BASE, auth=_basic_auth(), timeout=30) as client:
+        resp = await client.get("/fields", params={"list_id": DEALS_LIST_ID})
+        _raise_for_status(resp)
+        payload = resp.json()
+    fields = payload if isinstance(payload, list) else payload.get("fields", [])
+    numeric_id = int(STATUS_FIELD_ID.split("-")[-1])
+    field = next((f for f in fields if f.get("id") == numeric_id), None)
+    if field is None:
+        field = next((f for f in fields if (f.get("name") or "").strip().lower() == "status"), None)
+    if field is None:
+        return []
+    opts = sorted(field.get("dropdown_options") or [], key=lambda o: o.get("rank", 0))
+    return [{"id": o["id"], "text": o.get("text", "")} for o in opts if o.get("id") is not None]
+
+
+async def set_status(list_entry_id: int, status_option_id: int,
+                     reason: "dict | None" = None) -> None:
+    """Set a Deals list entry's Status to the given ranked-dropdown option, and optionally write
+    a pass reason too (used when the status is "Passed").
+
+    Uses the v2 list-entry field-update endpoint:
+        PATCH /v2/lists/{list}/list-entries/{entry}/fields
+        {"operation": "update-fields", "updates": [{"id": <field>, "value": {...}}, ...]}
+    Status and the (optional) reason go in ONE request (update-fields batches field updates on
+    an entry). `reason` is {"field_id", "value_type", "option_id"} (from get_pass_reasons).
+    Writes shared CRM data — callers gate this behind a confirmation. Backs off on 429s and
+    fails fast on org-quota exhaustion (via _request_with_retry).
+    """
+    updates = [{"id": STATUS_FIELD_ID,
+                "value": {"type": "ranked-dropdown",
+                          "data": {"dropdownOptionId": status_option_id}}}]
+    if reason and reason.get("field_id") and reason.get("option_id") is not None:
+        value_type = reason.get("value_type") or "dropdown"
+        option = {"dropdownOptionId": reason["option_id"]}
+        # multi-select fields take a LIST of options; single-select takes one object
+        data = [option] if value_type.endswith("-multi") else option
+        updates.append({"id": reason["field_id"], "value": {"type": value_type, "data": data}})
+
+    url = f"{AFFINITY_V2_BASE}/lists/{DEALS_LIST_ID}/list-entries/{list_entry_id}/fields"
+    body = {"operation": "update-fields", "updates": updates}
     async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(url, json=body, headers=_bearer_headers())
-        resp.raise_for_status()
+        await _request_with_retry(
+            lambda: client.patch(url, json=body, headers=_bearer_headers()))

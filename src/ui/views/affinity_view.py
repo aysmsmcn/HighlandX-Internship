@@ -11,20 +11,23 @@ from config import LOGOS_DIR
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QListWidget,
                                QListWidgetItem, QLabel, QSplitter, QTextBrowser, QLineEdit,
                                QComboBox, QApplication, QInputDialog, QMenu, QMessageBox,
-                               QFileDialog, QSpinBox, QDialog)
-from PySide6.QtCore import Qt, QUrl, QByteArray, QSize
+                               QFileDialog, QSpinBox, QDialog, QPlainTextEdit, QProgressDialog)
+from PySide6.QtCore import Qt, QUrl, QByteArray, QSize, QEvent
 from PySide6.QtGui import (QShortcut, QKeySequence, QIcon, QPixmap, QColor, QPalette,
                            QFont)
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore import QWebEngineProfile, QWebEnginePage
 from qasync import asyncSlot
 
-from services.affinity_service import (my_owner_id, list_my_companies, Company,
+from services.affinity_service import (my_owner_id, list_my_companies, list_passed_companies, Company,
                                        company_url, get_company_notes, create_note,
-                                       pass_company, Note,
-                                       get_company_summary, Interaction, company_has_notes,
-                                       companies_to_json, companies_from_json, reach_out_suggestion,
+                                       set_status, get_pass_reasons, get_statuses, Note,
+                                       get_company_summary, Interaction,
+                                       companies_to_json, companies_from_json,
+                                       notes_to_json, notes_from_json, reach_out_suggestion,
                                        fit_score, proceed_recommendation,
+                                       discover_owners, Owner, owners_to_json, owners_from_json,
+                                       AffinityQuotaExhausted, PASSED_OPTION_ID,
                                        DEFAULT_GOOD_FIT_THRESHOLD, DEFAULT_PASS_THRESHOLD)
 from services.fit_service import get_all_overrides, set_override, clear_override
 from services.logo_service import get_logo_bytes, _cache_path
@@ -33,13 +36,21 @@ from services.outlook_service import get_calendar_events, get_message_by_interac
 from services.settings_service import get_setting, set_setting
 from services.cache_service import read_cache, write_cache
 from services.lists_service import (get_lists, create_list, get_members, add_company,
-                                    remove_company, delete_list)
+                                    remove_company, delete_list, rename_list)
 from services.local_notes_service import add_local_note, get_local_notes, delete_local_note
 from services import raylu_service
 
 # Cache keys for the local SQLite store.
 CACHE_COMPANIES = "affinity.companies"
-CACHE_NOTED_IDS = "affinity.noted_ids"
+CACHE_OWNERS = "affinity.owners"      # discovered Deals-list owners for the owner dropdown
+CACHE_AFFINITY_NOTES_PREFIX = "affinity.notes."   # per-company: CACHE_AFFINITY_NOTES_PREFIX + id
+CACHE_PASS_REASONS = "affinity.pass_reasons"      # discovered Pass Reason dropdown field + options
+CACHE_STATUSES = "affinity.statuses"              # discovered Status dropdown options
+CACHE_PASSED = "affinity.passed"                  # the owner's Passed companies (separate filter)
+
+# Owner-dropdown sentinel: the default "load the connected user's own deals" choice.
+# Uses None as its userData so load() falls back to my_owner_id() (whoami).
+MY_DEALS_LABEL = "My deals (default)"
 
 # Best-guess PitchBook search URL. If it doesn't land on a search, do a search in
 # the panel, copy the address-bar URL, and replace this template ({q} = query).
@@ -69,7 +80,8 @@ def _blank_date(d: str | None) -> str:
     return d[:10] if d else "---"
 
 
-REMINDERS_ORDER_OPTIONS = ["Newest First", "Oldest First",
+REMINDERS_ORDER_OPTIONS = ["Newest Added", "Oldest Added",
+                           "Newest Founded", "Oldest Founded",
                            "Highest Fit Score", "Lowest Fit Score",
                            "Most urgent first", "Least urgent first",
                            "Longest Since Raised", "Most Recently Raised"]
@@ -109,11 +121,11 @@ CATEGORY_DEFS = [
     ("upcoming", "Upcoming meetings"),         # OVERLAPS: matched upcoming calendar event
     ("followup", "Follow up"),                 # emailed and they replied
     ("noresponse", "Contacted, no response"),  # only we have emailed them
-    ("noted", "Noted, not contacted"),         # untouched but has a note
-    ("missed", "Missed"),                      # untouched, no note
+    ("missed", "Missed"),                      # untouched (whether or not it has a note)
     ("missingfin", "Missing financial data"),  # OVERLAPS: any Affinity funding field absent
+    ("passed", "Passed"),                      # SEPARATE: the owner's Passed deals — NOT in "All"
 ]
-_EXCLUSIVE_KEYS = ("ongoing", "followup", "noresponse", "noted", "missed")
+_EXCLUSIVE_KEYS = ("ongoing", "followup", "noresponse", "missed")
 
 # Detail-pane buttons: transparent fill so the company gradient shows through, with a
 # theme-neutral outline + hover so they still read as buttons. QSS on QPushButton is
@@ -178,6 +190,15 @@ def _last_raised_sort_key(company: Company | None, longest_first: bool) -> tuple
     return (0, -days if longest_first else days)
 
 
+def _founded_sort_key(company: Company | None, newest_first: bool) -> tuple[int, int]:
+    """Sort key for founding year. Companies with no founding year always sort last,
+    regardless of direction."""
+    year = company.year_founded if company else None
+    if year is None:
+        return (1, 0)                          # unknown founding year → always last
+    return (0, -year if newest_first else year)
+
+
 def _months_since_raised(company: Company | None) -> int | None:
     """Whole calendar months between the last funding date and today (None if unknown)."""
     d = company.last_funding_date if company else None
@@ -234,9 +255,11 @@ def sort_companies(items, mode: str, overrides: dict[int, int], key=lambda c: c)
     by_score = mode in ("Highest Fit Score", "Lowest Fit Score")
     by_reachout = mode in ("Most urgent first", "Least urgent first")
     by_raised = mode in ("Longest Since Raised", "Most Recently Raised")
+    by_founded = mode in ("Newest Founded", "Oldest Founded")
     most_urgent = mode == "Most urgent first"
     longest_first = mode == "Longest Since Raised"
-    reverse = mode in ("Newest First", "Highest Fit Score")
+    newest_founded = mode == "Newest Founded"
+    reverse = mode in ("Newest Added", "Highest Fit Score")
     items = list(items)
     if by_score:
         items.sort(key=lambda x: _score_sort_value(key(x), overrides), reverse=reverse)
@@ -244,7 +267,9 @@ def sort_companies(items, mode: str, overrides: dict[int, int], key=lambda c: c)
         items.sort(key=lambda x: _reachout_sort_key(key(x), most_urgent))
     elif by_raised:
         items.sort(key=lambda x: _last_raised_sort_key(key(x), longest_first))
-    else:
+    elif by_founded:
+        items.sort(key=lambda x: _founded_sort_key(key(x), newest_founded))
+    else:                                       # "Newest Added" / "Oldest Added": by date added
         items.sort(key=lambda x: (key(x).added or "") if key(x) else "", reverse=reverse)
     return items
 
@@ -354,8 +379,14 @@ def _money(amount: float | None) -> str:
     return f"${amount:,.0f}"
 
 
+class NoCompanyColumnError(Exception):
+    """Raised when an imported file has no company-name / company-domain column header."""
+
+
 def _friendly(err: Exception) -> str:
     """Turn a raw exception into a short, plain-language message."""
+    if isinstance(err, AffinityQuotaExhausted):
+        return str(err)          # already a clear "quota exhausted — resets in N days" message
     text = str(err).lower()
     if "timed out" in text or "cancel" in text:
         return "Microsoft sign-in was cancelled or timed out — try again."
@@ -396,7 +427,8 @@ class _PopoutWindow(QWidget):
 class AffinityView(QWidget):
     def __init__(self) -> None:
         super().__init__()
-        self._companies: list[Company] = []      # full loaded set
+        self._companies: list[Company] = []      # full loaded set (active statuses)
+        self._passed: list[Company] = []          # the owner's Passed deals (separate "Passed" filter)
         self._current: Company | None = None
         self._web_source: str | None = None      # last web panel source (for auto-refresh)
         self._notes: list[Note] = []
@@ -405,7 +437,6 @@ class AffinityView(QWidget):
         self._reminders: list[Company | None] = []   # rows of the reminders/list pane (None = not loaded)
         self._reminder_ids: list[int] = []            # company id per reminders row (for list removal)
         self._reminders_window: QWidget | None = None  # the popped-out reminders window, if any
-        self._noted_ids: set[int] = set()         # org ids that have at least one note
         self._categorized: dict[str, list[Company]] = {}   # category key -> companies
         self._event_company_ids: set[int] = set()          # companies with an upcoming meeting
         self._overrides: dict[int, int] = get_all_overrides()   # company_id -> manual fit score
@@ -417,14 +448,26 @@ class AffinityView(QWidget):
         self.refresh_btn = QPushButton("Refresh from Affinity")
         self.refresh_btn.setToolTip("Re-fetch everything from Affinity (slow — minutes). "
                                     "The app shows cached data instantly on launch.")
+
+        # Owner switcher: pick whose Deals-list companies the next Refresh loads. Populated
+        # from cached owners discovered by "Find owners" (a full-list scan, skipping Passed).
+        self.owner_selector = QComboBox()
+        self.owner_selector.setToolTip(
+            "Whose deals to load. Pick a colleague, then click “Refresh from Affinity”. "
+            "Use “Find owners” to (re)build this list from the Deals list.")
+        self.discover_owners_btn = QPushButton("Find owners")
+        self.discover_owners_btn.setToolTip(
+            "Scan active deals (New / Reached Out / Tracking) to collect everyone who owns one, "
+            "and cache them for this dropdown. Runs once, then cached.")
+        self._populate_owner_selector(owners=[])   # seed with the default item; cache fills it later
         self.generate_csv_btn = QPushButton("Generate CSV")
         self.generate_csv_btn.setToolTip(
             "Export the companies in the current view to a CSV file (name, domain, "
             "Affinity ID, last email/meeting, and funding fields).")
-        self.update_affinity_btn = QPushButton("Update Affinity")
-        self.update_affinity_menu = QMenu(self)
-        self.update_affinity_menu.addAction("Pass All…").triggered.connect(self._pass_all)
-        self.update_affinity_btn.setMenu(self.update_affinity_menu)   # dropdown of bulk actions
+        self.update_status_btn = QPushButton("Update Status")
+        self.update_status_btn.setToolTip(
+            "Set every company in the selected list to a chosen Affinity status "
+            "(Passed is one of the options).")
         self.status = QLabel("Loading cached companies…")
 
         # --- events widgets (shown in the "View Upcoming Events" popup, EventsDialog —
@@ -435,7 +478,7 @@ class AffinityView(QWidget):
         # --- reminders pane (top) ---
         self.reminders_order = QComboBox()
         self.reminders_order.addItems(REMINDERS_ORDER_OPTIONS)
-        self.reminders_order.setCurrentText(get_setting("pref.reminders_order", "Newest first"))
+        self.reminders_order.setCurrentText(get_setting("pref.reminders_order", "Newest Added"))
 
         # "Founding Date" filter controls — shown only when that list is selected.
         self.founding_dir = QComboBox()
@@ -468,6 +511,8 @@ class AffinityView(QWidget):
         # list selector: built-in "Noted, not contacted" + custom watchlists, with a
         # "+" to create a new list
         self.list_selector = QComboBox()
+        self.list_selector.setToolTip(
+            "Your lists and live buckets. Right-click or double-click a custom list to rename it.")
         self.add_list_btn = QPushButton("+")
         self.add_list_btn.setFixedWidth(28)
         self.add_list_btn.setToolTip("Create a new list")
@@ -476,7 +521,7 @@ class AffinityView(QWidget):
         self.del_list_btn.setToolTip("Delete the selected list")
         self.import_list_btn = QPushButton("Import")
         self.import_list_btn.setToolTip(
-            "Create a list from a CSV or a pasted list of company names/domains")
+            "Create a list from a CSV/Excel (.xlsx) file or a pasted list of company names/domains")
         self.popout_btn = QPushButton("Pop out")
         self.popout_btn.setToolTip("Open the reminders pane in its own window")
         self._refresh_list_selector()
@@ -506,7 +551,7 @@ class AffinityView(QWidget):
         self.company_order = QComboBox()
         self.company_order.setToolTip("Sort the company list")
         self.company_order.addItems(REMINDERS_ORDER_OPTIONS)
-        self.company_order.setCurrentText(get_setting("pref.company_order", "Newest First"))
+        self.company_order.setCurrentText(get_setting("pref.company_order", "Newest Added"))
 
         self.company_list = QListWidget()
         self.company_list.setIconSize(LOGO_ICON_SIZE)
@@ -637,7 +682,7 @@ class AffinityView(QWidget):
         self.reminders_box = _titled("Reminders",
                                      reminders_header, self.reminders_order, self.founding_controls,
                                      self.reminders_status, self.reminders_list,
-                                     self.update_affinity_btn)
+                                     self.update_status_btn)
         right_col = QSplitter(Qt.Orientation.Vertical)
         right_col.addWidget(self.reminders_box)
         right_col.addWidget(selected)
@@ -654,6 +699,12 @@ class AffinityView(QWidget):
         content = QWidget()
         cv = QVBoxLayout(content)
         cv.setContentsMargins(0, 0, 0, 0)
+        owner_row = QHBoxLayout()
+        owner_row.setContentsMargins(0, 0, 0, 0)
+        owner_row.addWidget(QLabel("Owner:"))
+        owner_row.addWidget(self.owner_selector, 1)
+        owner_row.addWidget(self.discover_owners_btn)
+        cv.addLayout(owner_row)
         cv.addWidget(self.refresh_btn)
         cv.addWidget(self.generate_csv_btn)
         cv.addWidget(self.status)
@@ -688,6 +739,8 @@ class AffinityView(QWidget):
         layout.addWidget(outer)
 
         self.refresh_btn.clicked.connect(self.load)
+        self.discover_owners_btn.clicked.connect(self._discover_owners)
+        self.update_status_btn.clicked.connect(self._update_status)
         self.generate_csv_btn.clicked.connect(self._generate_csv)
         self.search_box.textChanged.connect(self.apply_filter)
         self.reminders_order.currentIndexChanged.connect(lambda _i: self._on_order_changed())
@@ -704,6 +757,10 @@ class AffinityView(QWidget):
         self.reminders_list.currentRowChanged.connect(self.select_from_reminder)
         self.reminders_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.reminders_list.customContextMenuRequested.connect(self._reminders_context_menu)
+        # rename a custom list: right-click the dropdown, or double-click an item in its popup
+        self.list_selector.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.list_selector.customContextMenuRequested.connect(self._list_selector_context_menu)
+        self.list_selector.view().viewport().installEventFilter(self)
         self.detail_name.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.detail_name.customContextMenuRequested.connect(self._detail_name_context_menu)
         self.company_list.currentRowChanged.connect(self._company_selected)
@@ -753,10 +810,16 @@ class AffinityView(QWidget):
     async def load(self) -> None:
         self.refresh_btn.setEnabled(False)
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        self.status.setText("Refreshing from Affinity…")
+        owner_name = self.owner_selector.currentText()
+        self.status.setText(f"Refreshing {owner_name}'s deals from Affinity…")
         try:
-            pid = await my_owner_id()
+            # Selected owner's person id, or None ("My deals") → the connected user (whoami).
+            pid = self.owner_selector.currentData()
+            if pid is None:
+                pid = await my_owner_id()
             self._companies = await list_my_companies(pid)
+            self._loaded_pid = pid          # for the background Passed fetch
+            self._passed = []               # clear the previous owner's Passed set until reloaded
         except Exception as err:
             self.status.setText(_friendly(err))
             QApplication.restoreOverrideCursor()
@@ -769,39 +832,96 @@ class AffinityView(QWidget):
         updated = write_cache(CACHE_COMPANIES, companies_to_json(self._companies))
         self.apply_filter()                     # partitions + builds reminders + sets status
         self.status.setText(
-            self.status.text() + f"  ·  updated {self._ago(updated)} — loading notes & events…")
+            self.status.text() + f"  ·  updated {self._ago(updated)} — loading events…")
         QApplication.restoreOverrideCursor()
         asyncio.ensure_future(self._finish_load_background())
+
+    def _populate_owner_selector(self, owners: list[Owner]) -> None:
+        """Rebuild the owner dropdown: a default "My deals" item (userData=None) followed by
+        each discovered owner (userData = their person id). Preserves the current selection
+        by person id when possible."""
+        prev = self.owner_selector.currentData()
+        self.owner_selector.blockSignals(True)
+        self.owner_selector.clear()
+        self.owner_selector.addItem(MY_DEALS_LABEL, None)
+        for o in owners:
+            self.owner_selector.addItem(o.name, o.id)
+        # Restore the prior pick if it survived the rebuild; else fall back to the default.
+        idx = self.owner_selector.findData(prev) if prev is not None else 0
+        self.owner_selector.setCurrentIndex(idx if idx >= 0 else 0)
+        self.owner_selector.blockSignals(False)
+
+    def _load_owners_from_cache(self) -> None:
+        """Fill the owner dropdown from the locally cached owner list (instant, no network)."""
+        text, _ = read_cache(CACHE_OWNERS)
+        if not text:
+            return
+        try:
+            self._populate_owner_selector(owners_from_json(text))
+        except Exception:
+            pass       # a bad/old cache shouldn't break startup — just leave the default item
+
+    @asyncSlot()
+    async def _discover_owners(self) -> None:
+        """Scan active deals for distinct owners, cache them, and fill the dropdown."""
+        self.discover_owners_btn.setEnabled(False)
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        self.status.setText("Finding deal owners (scanning active deals)…")
+
+        def _progress(scanned: int, found: int) -> None:
+            self.status.setText(
+                f"Finding deal owners… scanned {scanned:,} active deals, {found} owners so far.")
+
+        try:
+            owners = await discover_owners(progress=_progress)
+        except Exception as err:
+            self.status.setText(_friendly(err))
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+            self.discover_owners_btn.setEnabled(True)
+        write_cache(CACHE_OWNERS, owners_to_json(owners))
+        self._populate_owner_selector(owners)
+        self.status.setText(f"Found {len(owners)} deal owners — pick one and Refresh.")
 
     async def _finish_load_background(self) -> None:
         """The slow, non-critical parts of a refresh — run after companies are on screen."""
         try:
-            await self._index_noted_background()   # notes-index → reminders pane
-            await self._load_events()              # Outlook calendar (also triggers MS login)
+            # The owner's Passed deals — a second filtered fetch, kept off the critical path
+            # since it's a separate call and can be large. Populates the "Passed" filter.
+            await self._load_passed()
+            # Refresh makes only the companies call (v2). The Outlook calendar is Microsoft
+            # Graph, not Affinity, so it doesn't touch the Affinity quota. (The old per-company
+            # notes-index that used to run here was removed when "Noted, not contacted" was
+            # merged into "Missed".)
+            await self._load_events()              # Outlook calendar (Graph, not Affinity quota)
         finally:
             self.refresh_btn.setEnabled(True)
-            self.status.setText(self.status.text().replace(" — loading notes & events…", ""))
+            self.status.setText(self.status.text().replace(" — loading events…", ""))
 
-    async def _index_noted_background(self) -> None:
-        """Rebuild the noted-companies index off the critical path, then re-bucket."""
-        self.status.setText(self.status.text() + "  ·  checking notes…")
-        try:
-            await self._index_noted_missed()
-            write_cache(CACHE_NOTED_IDS, json.dumps(sorted(self._noted_ids)))
-        except Exception:
+    async def _load_passed(self) -> None:
+        """Fetch the loaded owner's Passed deals into the separate "Passed" filter, then cache."""
+        pid = getattr(self, "_loaded_pid", None)
+        if pid is None:
             return
-        self.apply_filter()                      # re-bucket so "Noted, not contacted" reflects notes
+        try:
+            self._passed = await list_passed_companies(pid)
+        except Exception:
+            return                                 # leave the Passed filter empty on failure
+        write_cache(CACHE_PASSED, companies_to_json(self._passed))
+        self.apply_filter()                        # re-bucket so the "Passed" filter fills in
 
     def load_from_cache(self) -> None:
         """Populate the UI from the local SQLite cache — instant, no network, no MS login."""
+        self._load_owners_from_cache()          # fill the owner dropdown from cache
         text, updated = read_cache(CACHE_COMPANIES)
         if not text:
             self.status.setText("No cached data yet — click “Refresh from Affinity”.")
             return
         try:
             self._companies = companies_from_json(text)
-            noted_text, _ = read_cache(CACHE_NOTED_IDS)
-            self._noted_ids = set(json.loads(noted_text)) if noted_text else set()
+            passed_text, _ = read_cache(CACHE_PASSED)
+            self._passed = companies_from_json(passed_text) if passed_text else []
         except Exception as err:
             self.status.setText(_friendly(err))
             return
@@ -839,6 +959,9 @@ class AffinityView(QWidget):
         buckets["upcoming"] = [c for c in visible if c.id in self._event_company_ids]
         # "Missing financial data" also overlaps: any company missing an Affinity funding field.
         buckets["missingfin"] = [c for c in visible if _missing_financials(c)]
+        # "Passed" is a SEPARATE set (from list_passed_companies), not part of self._companies, so
+        # it never appears in "All" or any exclusive bucket. Still honors the search term.
+        buckets["passed"] = [c for c in self._passed if term in c.name.lower()]
         self._categorized = buckets
         self._update_cat_counts()
         self._display_companies()               # fills the single list + starts logo fetch
@@ -851,8 +974,6 @@ class AffinityView(QWidget):
             return "ongoing"
         if c.emailed:
             return "followup" if self._has_response(c) else "noresponse"
-        if c.id in self._noted_ids:
-            return "noted"
         return "missed"
 
     def _has_response(self, c: Company) -> bool:
@@ -932,24 +1053,82 @@ class AffinityView(QWidget):
         self.status.setText(f"Wrote {len(companies)} companies to {path}")
 
     @asyncSlot()
-    async def _pass_all(self) -> None:
-        """Set every company in the currently-selected reminders list to "Passed" in
-        Affinity. Bulk, shared-data write — gated behind an explicit confirmation."""
+    async def _update_status(self) -> None:
+        """Bulk-set every company in the selected reminders list to a chosen Affinity status.
+        Shared-data write — gated behind status selection + an explicit confirmation. Setting
+        the status to "Passed" runs the extra pass failsafes and writes a pass reason."""
         companies = [c for c in self._reminders if c and c.list_entry_id]
-        # self._reminders can hold None (a list member not in the current load) — those
-        # have no loaded list entry, so they're excluded from the count below.
+        # self._reminders can hold None (a list member not in the current load) — those have no
+        # loaded list entry, so they're excluded from the count below.
         skipped = len(self._reminders) - len(companies)
         if not companies:
+            rows = len(self._reminders)
+            no_entry = sum(1 for c in self._reminders if c and not c.list_entry_id)
             QMessageBox.information(
-                self, "Update Affinity",
-                "No companies to update in this reminders list — pick a list with loaded "
-                "companies (run “Refresh from Affinity” first if needed).")
+                self, "Update Status",
+                f"No companies to update. This list has {rows} row(s): "
+                f"{no_entry} loaded but without an Affinity list-entry id, and "
+                f"{rows - no_entry - len(companies)} not loaded in the current owner's data.\n\n"
+                "Refresh from Affinity for the owner these companies belong to, then try again.")
             return
 
         list_name = self.list_selector.currentText() or "this list"
-        months = int(get_setting("pref.pass_recent_contact_months", "3"))
+        picked = await self._pick_status(len(companies), list_name)
+        if picked is None:
+            return                                 # cancelled / unavailable at the status step
+        status_id, status_text = picked
+        is_pass = status_id == PASSED_OPTION_ID
 
-        # Failsafes: never pass Portfolio companies; flag recently-contacted ones for review.
+        # Shared failsafes for ANY status change: never touch Portfolio companies, and flag
+        # recently-contacted / recently-met ones for review (protected by default).
+        result = self._safeguard_review(companies, skipped, list_name, status_text, is_pass)
+        if result is None:
+            return                                 # cancelled or nothing selected
+        to_change, kept = result
+
+        reason = None
+        if is_pass:                                # Passed also writes a pass reason
+            reason = await self._pick_pass_reason()
+            if reason is None:
+                return                             # cancelled at the reason step
+        await self._apply_status_updates(to_change, status_id, status_text, reason, kept=kept)
+
+    async def _pick_status(self, count: int, list_name: str) -> "tuple[int, str] | None":
+        """Load the Affinity Status options and let the user pick a target status for the batch.
+        Returns (option_id, text), or None if cancelled / unavailable."""
+        statuses = None
+        try:
+            statuses = await get_statuses()
+            if statuses:
+                write_cache(CACHE_STATUSES, json.dumps(statuses))
+        except Exception:
+            statuses = None
+        if not statuses:                            # live fetch failed → fall back to cache
+            cached, _ = read_cache(CACHE_STATUSES)
+            if cached:
+                try:
+                    statuses = json.loads(cached)
+                except Exception:
+                    statuses = None
+        if not statuses:
+            QMessageBox.warning(self, "Update Status",
+                                "Couldn't load the Affinity statuses. Try again in a moment.")
+            return None
+
+        texts = [s["text"] for s in statuses]
+        choice, ok = QInputDialog.getItem(
+            self, "Update Status",
+            f"Set the {count} companies in “{list_name}” to which status?", texts, 0, False)
+        if not ok:
+            return None
+        s = next(x for x in statuses if x["text"] == choice)
+        return s["id"], s["text"]
+
+    def _safeguard_review(self, companies, skipped, list_name, status_text, is_pass):
+        """Shared bulk-change failsafes (applied for ANY target status): exclude Portfolio
+        companies entirely, and flag recently-contacted / recently-met ones for review
+        (protected by default). Returns (to_change, kept) or None if cancelled / nothing left."""
+        months = int(get_setting("pref.pass_recent_contact_months", "3"))
         portfolio = [c for c in companies if (c.status or "").strip().lower() == "portfolio"]
         candidates = [c for c in companies if c not in portfolio]
         recent: list[tuple[Company, str]] = []   # (company, last-contact date)
@@ -957,74 +1136,159 @@ class AffinityView(QWidget):
         for c in candidates:
             iso = _last_contact_iso(c)
             m = _months_since_date(iso)
-            if m is not None and m < months:
+            if m is not None and m < months:      # recently emailed or met → protect + review
                 recent.append((c, iso))
             else:
                 safe.append(c)
 
         if recent:
-            chosen = self._review_recent_contacts(list_name, safe, recent, portfolio, months)
+            chosen = self._review_recent_contacts(
+                list_name, safe, recent, portfolio, months, status_text)
             if chosen is None:                    # cancelled
-                return
-            to_pass = safe + chosen
+                return None
+            to_change = safe + chosen
         else:
             note = ""
             if portfolio:
-                note += f"\n\n({len(portfolio)} portfolio companies will NOT be passed.)"
+                note += f"\n\n({len(portfolio)} portfolio companies will NOT be changed.)"
             if skipped:
                 note += f"\n({skipped} with no loaded entry will be skipped.)"
+            undo = " and can't be easily undone" if is_pass else ""
             reply = QMessageBox.warning(
-                self, "Pass All",
-                f"Set {len(safe)} companies in “{list_name}” to “Passed” in Affinity?\n\n"
-                "This changes shared CRM data for your whole team and can't be easily undone."
-                + note,
+                self, "Update Status",
+                f"Set {len(safe)} companies in “{list_name}” to “{status_text}” in Affinity?\n\n"
+                f"This changes shared CRM data for your whole team{undo}." + note,
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
                 QMessageBox.StandardButton.Cancel)
             if reply != QMessageBox.StandardButton.Yes:
-                return
-            to_pass = safe
+                return None
+            to_change = safe
 
-        if not to_pass:
-            QMessageBox.information(self, "Pass All", "No companies selected to pass.")
-            return
+        if not to_change:
+            QMessageBox.information(self, "Update Status", "No companies selected.")
+            return None
+        kept = len(portfolio) + (len(recent) - (len(to_change) - len(safe)))
+        return to_change, kept
 
-        self.update_affinity_btn.setEnabled(False)
-        self.status.setText(f"Passing {len(to_pass)} companies in Affinity…")
+    async def _apply_status_updates(self, companies, status_id, status_text, reason, kept=0) -> None:
+        """Write the chosen status (and optional pass reason) to each company, concurrently,
+        showing a live progress dialog (with Cancel) and a final result summary."""
+        total = len(companies)
+        self.update_status_btn.setEnabled(False)
+
+        progress = QProgressDialog(
+            f"Updating {total} companies to “{status_text}” in Affinity…\n"
+            "(0 done)", "Cancel", 0, total, self)
+        progress.setWindowTitle("Update Status")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)             # show immediately
+        progress.setAutoClose(True)
+        progress.setAutoReset(False)
+        progress.setValue(0)
+
         sem = asyncio.Semaphore(8)
-        failed = 0
+        done_count = failed = succeeded = 0
+        first_error: Exception | None = None
 
         async def _one(c: Company) -> None:
-            nonlocal failed
+            nonlocal done_count, failed, succeeded, first_error
+            if progress.wasCanceled():
+                return
             async with sem:
+                if progress.wasCanceled():
+                    return
                 try:
-                    await pass_company(c.list_entry_id)
-                except Exception:
+                    await set_status(c.list_entry_id, status_id, reason=reason or None)
+                    succeeded += 1
+                except Exception as e:
                     failed += 1
+                    if first_error is None:
+                        first_error = e
+                finally:
+                    done_count += 1
+                    progress.setLabelText(
+                        f"Updating {total} companies to “{status_text}” in Affinity…\n"
+                        f"({done_count} done · {succeeded} ok"
+                        + (f" · {failed} failed" if failed else "") + ")")
+                    progress.setValue(done_count)
 
-        await asyncio.gather(*(_one(c) for c in to_pass))
-        done = len(to_pass) - failed
-        kept = len(portfolio) + (len(recent) - (len(to_pass) - len(safe)))
+        await asyncio.gather(*(_one(c) for c in companies))
+        progress.setValue(total)                   # ensure it closes
+        cancelled = progress.wasCanceled()
+
+        reason_note = f" · reason: {reason['text']}" if reason and reason.get("text") else ""
+        headline = (f"Cancelled — {succeeded} of {total} updated to “{status_text}”"
+                    if cancelled else f"Set {succeeded} companies to “{status_text}”")
         self.status.setText(
-            f"Passed {done} companies"
+            headline
             + (f" · {failed} failed" if failed else "")
-            + (f" · {kept} kept" if kept else "") + ".")
-        self.update_affinity_btn.setEnabled(True)
-        if done:
-            self.load()          # refresh — passed companies drop out of the active view
+            + (f" · {kept} kept" if kept else "") + reason_note + ".")
+        self.update_status_btn.setEnabled(True)
 
-    def _review_recent_contacts(self, list_name, safe, recent, portfolio, months):
-        """Warn about recently-contacted companies before passing. Returns the list of
-        recently-contacted companies the user chose to pass anyway, or None if cancelled."""
+        # Always show a final summary so the outcome (and any error) is never invisible.
+        summary = f"{succeeded} of {total} companies updated to “{status_text}”."
+        if cancelled:
+            summary = "Cancelled.\n\n" + summary
+        if failed and first_error is not None:
+            summary += f"\n\n{failed} failed. First error: {_friendly(first_error)}"
+        QMessageBox.information(self, "Update Status", summary)
+
+        if succeeded:
+            self.load()          # refresh — status changes can drop companies from the active view
+
+    async def _pick_pass_reason(self) -> "dict | None":
+        """Load the Pass Reason options and let the user pick one for the whole batch.
+
+        Returns a reason dict {field_id, value_type, option_id, text} to write, an empty dict
+        {} to pass with NO reason, or None to cancel the Pass All entirely."""
+        reasons = None
+        try:
+            reasons = await get_pass_reasons()
+            if reasons and reasons.get("options"):
+                write_cache(CACHE_PASS_REASONS, json.dumps(reasons))   # cache for offline reuse
+        except Exception:
+            reasons = None
+        if not reasons or not reasons.get("options"):     # live fetch failed → try cache
+            cached, _ = read_cache(CACHE_PASS_REASONS)
+            if cached:
+                try:
+                    reasons = json.loads(cached)
+                except Exception:
+                    reasons = None
+
+        if not reasons or not reasons.get("options"):
+            reply = QMessageBox.question(
+                self, "Pass reason",
+                "Couldn't load pass reasons from Affinity. Pass without writing a reason?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel)
+            return {} if reply == QMessageBox.StandardButton.Yes else None
+
+        no_reason = "(no reason)"
+        texts = [no_reason] + [o["text"] for o in reasons["options"]]
+        choice, ok = QInputDialog.getItem(
+            self, "Pass reason", "Reason to write for the passed companies:", texts, 0, False)
+        if not ok:
+            return None
+        if choice == no_reason:
+            return {}
+        opt = next(o for o in reasons["options"] if o["text"] == choice)
+        return {"field_id": reasons["field_id"], "value_type": reasons.get("value_type"),
+                "option_id": opt["id"], "text": opt["text"]}
+
+    def _review_recent_contacts(self, list_name, safe, recent, portfolio, months, status_text):
+        """Warn about recently-contacted companies before a bulk status change. Returns the list
+        of recently-contacted companies the user chose to include, or None if cancelled."""
         dlg = QDialog(self)
-        dlg.setWindowTitle("Pass All — review recent contacts")
+        dlg.setWindowTitle("Update Status — review recent contacts")
         dlg.resize(460, 460)
         lay = QVBoxLayout(dlg)
-        summary = (f"Passing companies in “{list_name}”.\n\n"
-                   f"{len(safe)} will be passed automatically.\n"
-                   f"{len(recent)} were contacted within {months} month(s) — "
-                   "check any you still want to pass (unchecked stays untouched).")
+        summary = (f"Setting companies in “{list_name}” to “{status_text}”.\n\n"
+                   f"{len(safe)} will be updated automatically.\n"
+                   f"{len(recent)} were contacted within {months} month(s) (recently emailed or "
+                   "met) — check any you still want to change (unchecked stays untouched).")
         if portfolio:
-            summary += f"\n{len(portfolio)} portfolio companies will NOT be passed."
+            summary += f"\n{len(portfolio)} portfolio companies will NOT be changed."
         summary_lbl = QLabel(summary)
         summary_lbl.setWordWrap(True)
         lay.addWidget(summary_lbl)
@@ -1042,7 +1306,7 @@ class AffinityView(QWidget):
         buttons.addStretch(1)
         cancel_btn = QPushButton("Cancel")
         cancel_btn.clicked.connect(dlg.reject)
-        proceed_btn = QPushButton("Proceed with Passing")
+        proceed_btn = QPushButton("Proceed")
         proceed_btn.clicked.connect(dlg.accept)
         buttons.addWidget(cancel_btn)
         buttons.addWidget(proceed_btn)
@@ -1152,7 +1416,7 @@ class AffinityView(QWidget):
     def _import_list(self) -> None:
         """Create a watchlist from a CSV file or a pasted list of company names/domains,
         matched against the loaded deals list."""
-        if not self._companies:
+        if not self._companies and not self._passed:
             QMessageBox.information(self, "Import list",
                                     "No companies loaded yet — refresh from Affinity first.")
             return
@@ -1161,7 +1425,7 @@ class AffinityView(QWidget):
         box = QMessageBox(self)
         box.setWindowTitle("Import list")
         box.setText("Where are the company names / domains coming from?")
-        csv_choice = box.addButton("From CSV file", QMessageBox.ButtonRole.AcceptRole)
+        csv_choice = box.addButton("From file (CSV / Excel)", QMessageBox.ButtonRole.AcceptRole)
         paste_choice = box.addButton("Paste a list", QMessageBox.ButtonRole.AcceptRole)
         box.addButton(QMessageBox.StandardButton.Cancel)
         box.exec()
@@ -1170,14 +1434,19 @@ class AffinityView(QWidget):
         tokens: list[str] = []
         if clicked is csv_choice:
             path, _ = QFileDialog.getOpenFileName(
-                self, "Import list", "", "CSV / text (*.csv *.txt);;All files (*)")
+                self, "Import list", "",
+                "Spreadsheet / CSV / text (*.xlsx *.csv *.txt);;All files (*)")
             if not path:
                 return
             try:
-                with open(path, newline="", encoding="utf-8-sig") as f:
-                    for row in csv.reader(f):
-                        tokens += row              # every cell is a candidate name/domain
-            except OSError as e:
+                tokens = self._read_tokens_from_file(path)
+            except NoCompanyColumnError:
+                QMessageBox.warning(
+                    self, "Import list",
+                    "There is no company name or company domain column. "
+                    "Please check the columns of the uploaded file again.")
+                return
+            except Exception as e:      # OSError, or openpyxl parse/format errors
                 QMessageBox.warning(self, "Import list", f"Couldn't read the file:\n{e}")
                 return
         elif clicked is paste_choice:
@@ -1192,28 +1461,281 @@ class AffinityView(QWidget):
 
         matched, unmatched = self._match_tokens(tokens)
         if not matched:
-            QMessageBox.information(self, "Import list",
-                                    "None of those matched a company in your deals list.")
+            # Nothing matched, but still let the user copy the unidentified entries.
+            if unmatched:
+                self._show_unmatched_dialog(
+                    unmatched, "None of those matched a company in your deals list.")
+            else:
+                QMessageBox.information(self, "Import list", "Nothing to import.")
             return
 
-        name, ok = QInputDialog.getText(self, "Import list", "Name for the new list:")
-        if not ok or not name.strip():
+        op = self._choose_import_operation()
+        if op is None:
+            return                                     # cancelled at the operation/destination step
+        operation, lid, list_name, is_new = op
+
+        # Exceptions: let the user uncheck matched companies to exclude from this operation.
+        verb = "adding to" if operation == "add" else "removing from"
+        selected = self._review_import_selection(matched, verb, list_name)
+        if selected is None:
+            return                                     # cancelled at the review step
+        if not selected:
+            QMessageBox.information(self, "Import list", "No companies selected.")
             return
-        lid = create_list(name.strip())
-        for c in matched:
-            add_company(lid, c.id, c.name)
+
+        if operation == "add":
+            already_ids = {cid for cid, _ in get_members(lid)}
+            newly = [c for c in selected if c.id not in already_ids]
+            for c in selected:
+                add_company(lid, c.id, c.name)         # dedupes: no-op if already a member
+            if is_new:
+                summary = f"Created “{list_name}” with {len(selected)} companies."
+            else:
+                summary = f"Added {len(newly)} companies to “{list_name}”."
+                already = len(selected) - len(newly)
+                if already:
+                    summary += f" ({already} already in the list.)"
+        else:  # remove
+            member_ids = {cid for cid, _ in get_members(lid)}
+            removed = [c for c in selected if c.id in member_ids]
+            for c in selected:
+                remove_company(lid, c.id)              # no-op if it isn't a member
+            summary = f"Removed {len(removed)} companies from “{list_name}”."
+            not_member = len(selected) - len(removed)
+            if not_member:
+                summary += f" ({not_member} weren’t in the list.)"
+
         self._refresh_list_selector()
         idx = self.list_selector.findData(lid)
         if idx >= 0:
             self.list_selector.setCurrentIndex(idx)   # select it → fires _build_reminders
+        self._build_reminders()                       # reflect removals when the list is already shown
 
-        self.status.setText(f"Imported {len(matched)} companies into “{name.strip()}”.")
-        summary = f"Created “{name.strip()}” with {len(matched)} companies."
+        self.status.setText(summary)
         if unmatched:
-            preview = ", ".join(unmatched[:5]) + ("…" if len(unmatched) > 5 else "")
-            summary += f"\n\n{len(unmatched)} entr{'y' if len(unmatched) == 1 else 'ies'} " \
-                       f"didn't match a company: {preview}"
-        QMessageBox.information(self, "Import list", summary)
+            self._show_unmatched_dialog(unmatched, summary)
+        else:
+            QMessageBox.information(self, "Import list", summary)
+
+    def _choose_import_operation(self) -> "tuple[str, int, str, bool] | None":
+        """Ask whether to ADD the matched companies to a list or REMOVE them from one, then pick
+        the target list. Returns (operation, list_id, list_name, is_new) — operation is "add" or
+        "remove" — or None if cancelled. Remove is only offered when a list already exists."""
+        existing = get_lists()
+        if existing:
+            box = QMessageBox(self)
+            box.setWindowTitle("Import list")
+            box.setText("Add the matched companies to a list, or remove them from one?")
+            add_btn = box.addButton("Add to a list", QMessageBox.ButtonRole.AcceptRole)
+            remove_btn = box.addButton("Remove from a list", QMessageBox.ButtonRole.AcceptRole)
+            box.addButton(QMessageBox.StandardButton.Cancel)
+            box.exec()
+            clicked = box.clickedButton()
+            if clicked is remove_btn:
+                picked = self._pick_existing_list("Remove the companies from which list?")
+                return None if picked is None else ("remove", picked[0], picked[1], False)
+            if clicked is not add_btn:
+                return None                            # cancelled
+
+        dest = self._choose_import_destination()       # New vs Existing (add path)
+        if dest is None:
+            return None
+        lid, name, is_new = dest
+        return "add", lid, name, is_new
+
+    def _pick_existing_list(self, prompt: str) -> "tuple[int, str] | None":
+        """Pick one of the user's existing lists by name. Returns (list_id, name) or None."""
+        existing = get_lists()
+        if not existing:
+            QMessageBox.information(self, "Import list", "You have no lists yet.")
+            return None
+        names = [nm for _, nm in existing]
+        name, ok = QInputDialog.getItem(self, "Import list", prompt, names, 0, False)
+        if not ok or not name:
+            return None
+        return next(i for i, nm in existing if nm == name), name
+
+    def _review_import_selection(self, matched: list[Company], verb: str,
+                                 list_name: str) -> "list[Company] | None":
+        """Show the matched companies with checkboxes (all checked) so the user can exclude some
+        ('exceptions'). Returns the checked companies, or None if cancelled."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Import list — choose companies")
+        dlg.resize(440, 420)
+        v = QVBoxLayout(dlg)
+        v.addWidget(QLabel(
+            f"{len(matched)} companies matched. Uncheck any to exclude from "
+            f"{verb} “{list_name}”:"))
+        lw = QListWidget()
+        for c in matched:
+            item = QListWidgetItem(f"{c.name}" + (f"  ·  {c.domain}" if c.domain else ""))
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Checked)
+            item.setData(Qt.ItemDataRole.UserRole, c)
+            lw.addItem(item)
+        v.addWidget(lw)
+
+        def _set_all(state) -> None:
+            for i in range(lw.count()):
+                lw.item(i).setCheckState(state)
+
+        row = QHBoxLayout()
+        all_btn = QPushButton("Select all")
+        all_btn.clicked.connect(lambda: _set_all(Qt.CheckState.Checked))
+        none_btn = QPushButton("Deselect all")
+        none_btn.clicked.connect(lambda: _set_all(Qt.CheckState.Unchecked))
+        ok_btn = QPushButton("OK")
+        ok_btn.clicked.connect(dlg.accept)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(dlg.reject)
+        row.addWidget(all_btn)
+        row.addWidget(none_btn)
+        row.addStretch(1)
+        row.addWidget(cancel_btn)
+        row.addWidget(ok_btn)
+        v.addLayout(row)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return None
+        return [lw.item(i).data(Qt.ItemDataRole.UserRole) for i in range(lw.count())
+                if lw.item(i).checkState() == Qt.CheckState.Checked]
+
+    def _choose_import_destination(self) -> "tuple[int, str, bool] | None":
+        """Ask whether to import into a NEW list or an EXISTING one. Returns
+        (list_id, list_name, is_new), or None if the user cancels."""
+        existing = get_lists()                         # [(id, name)], ordered by name
+        make_new = True
+        if existing:
+            box = QMessageBox(self)
+            box.setWindowTitle("Import list")
+            box.setText("Add the matched companies to a new list or an existing one?")
+            new_btn = box.addButton("New list", QMessageBox.ButtonRole.AcceptRole)
+            existing_btn = box.addButton("Existing list", QMessageBox.ButtonRole.AcceptRole)
+            box.addButton(QMessageBox.StandardButton.Cancel)
+            box.exec()
+            clicked = box.clickedButton()
+            if clicked is existing_btn:
+                make_new = False
+            elif clicked is not new_btn:
+                return None                            # cancelled
+
+        if make_new:
+            name, ok = QInputDialog.getText(self, "Import list", "Name for the new list:")
+            if not ok or not name.strip():
+                return None
+            return create_list(name.strip()), name.strip(), True
+
+        names = [nm for _, nm in existing]
+        name, ok = QInputDialog.getItem(
+            self, "Import list", "Add to which list?", names, 0, False)   # editable=False
+        if not ok or not name:
+            return None
+        lid = next(i for i, nm in existing if nm == name)
+        return lid, name, False
+
+    def _read_tokens_from_file(self, path: str) -> list[str]:
+        """Read candidate tokens from a file's company-name / company-domain column(s) only.
+
+        Supports .xlsx (each sheet checked independently) and CSV/TXT. In each, the first
+        non-empty row is treated as the header; only columns whose header names a company
+        name or domain are scanned. Raises NoCompanyColumnError if no such column exists,
+        or other errors (OSError / openpyxl) for the caller to surface."""
+        if path.lower().endswith(".xlsx"):
+            from openpyxl import load_workbook          # optional dep; imported lazily
+            wb = load_workbook(path, read_only=True, data_only=True)   # values, not formulas
+            tokens: list[str] = []
+            found = False
+            try:
+                for ws in wb.worksheets:
+                    got = self._tokens_from_rows(list(ws.iter_rows(values_only=True)))
+                    if got is not None:                 # this sheet had a name/domain column
+                        found = True
+                        tokens += got
+            finally:
+                wb.close()
+            if not found:
+                raise NoCompanyColumnError()
+            return tokens
+        # CSV / plain text
+        with open(path, newline="", encoding="utf-8-sig") as f:
+            got = self._tokens_from_rows(list(csv.reader(f)))
+        if got is None:
+            raise NoCompanyColumnError()
+        return got
+
+    @staticmethod
+    def _tokens_from_rows(rows: list) -> list[str] | None:
+        """Find the header row (first non-empty) and the company-name / company-domain columns,
+        then return the values from those columns (header excluded). Returns None if the file
+        has no such column, so the caller can distinguish "no matching header" from "no data"."""
+        header_idx = next(
+            (i for i, row in enumerate(rows)
+             if any(c is not None and str(c).strip() for c in row)), None)
+        if header_idx is None:
+            return None                                 # empty file → treated as "no column"
+        headers = [(str(c).strip().lower() if c is not None else "") for c in rows[header_idx]]
+
+        cols: set[int] = set()
+        for j, h in enumerate(headers):
+            if "name" in h or h == "company":                       # company-name column
+                cols.add(j)
+            if any(k in h for k in ("domain", "website", "url")):   # company-domain column
+                cols.add(j)
+        if not cols:
+            return None
+
+        tokens: list[str] = []
+        for row in rows[header_idx + 1:]:
+            for j in cols:
+                if j < len(row) and row[j] is not None:
+                    val = str(row[j]).strip()
+                    if val:
+                        tokens.append(val)
+        return tokens
+
+    def _show_unmatched_dialog(self, unmatched: list[str], header: str) -> None:
+        """Show the entries that couldn't be identified (as domains where they look like one),
+        in a read-only, selectable list with a one-click Copy-to-clipboard button."""
+        entries = [self._as_domain_or_raw(t) for t in unmatched]
+        text = "\n".join(entries)
+        n = len(entries)
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Import list — unidentified companies")
+        v = QVBoxLayout(dlg)
+        v.addWidget(QLabel(
+            f"{header}\n\n{n} entr{'y' if n == 1 else 'ies'} could not be identified "
+            f"(no matching company in your deals list):"))
+        view = QPlainTextEdit()
+        view.setReadOnly(True)
+        view.setPlainText(text)
+        v.addWidget(view)
+
+        row = QHBoxLayout()
+        copy_btn = QPushButton("Copy to clipboard")
+
+        def _copy() -> None:
+            QApplication.clipboard().setText(text)
+            copy_btn.setText("Copied ✓")
+
+        copy_btn.clicked.connect(_copy)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dlg.accept)
+        row.addWidget(copy_btn)
+        row.addStretch(1)
+        row.addWidget(close_btn)
+        v.addLayout(row)
+        dlg.resize(440, 380)
+        dlg.exec()
+
+    @staticmethod
+    def _as_domain_or_raw(token: str) -> str:
+        """Normalize a domain-like token (has a dot, no spaces) to a clean domain; otherwise
+        return it unchanged (e.g. a plain company name)."""
+        t = (token or "").strip()
+        if "." in t and not any(ch.isspace() for ch in t):
+            return AffinityView._norm_domain(t)
+        return t
 
     @staticmethod
     def _norm_domain(s: str) -> str:
@@ -1224,10 +1746,12 @@ class AffinityView(QWidget):
         return re.sub(r"^www\.", "", s)
 
     def _match_tokens(self, tokens: list[str]) -> tuple[list[Company], list[str]]:
-        """Match name/domain tokens to loaded companies. Numeric-only cells (IDs, amounts,
+        """Match name/domain tokens to loaded companies — the active set AND the owner's Passed
+        deals, so passed-on companies are recognized too. Numeric-only cells (IDs, amounts,
         dates) are ignored. Returns (matched companies deduped, unmatched tokens deduped)."""
-        by_domain = {self._norm_domain(c.domain): c for c in self._companies if c.domain}
-        by_name = {c.name.strip().lower(): c for c in self._companies if c.name}
+        pool = self._companies + self._passed         # active + Passed (disjoint status sets)
+        by_domain = {self._norm_domain(c.domain): c for c in pool if c.domain}
+        by_name = {c.name.strip().lower(): c for c in pool if c.name}
         matched: dict[int, Company] = {}
         unmatched: list[str] = []
         seen_unmatched: set[str] = set()
@@ -1280,6 +1804,47 @@ class AffinityView(QWidget):
             return
         delete_list(list_id)
         self._refresh_list_selector()          # drops it; selection falls back to the built-in
+        self._build_reminders()
+
+    def _list_selector_context_menu(self, pos) -> None:
+        """Right-click the list dropdown to rename the selected custom list."""
+        list_id = self.list_selector.currentData()
+        if not isinstance(list_id, int):       # live buckets aren't real lists — can't rename
+            return
+        menu = QMenu(self)
+        menu.addAction("Rename list…").triggered.connect(lambda: self._rename_list(list_id))
+        menu.exec(self.list_selector.mapToGlobal(pos))
+
+    def eventFilter(self, obj, event):
+        """Double-click an item in the list dropdown's popup to rename that custom list."""
+        if (obj is self.list_selector.view().viewport()
+                and event.type() == QEvent.Type.MouseButtonDblClick):
+            idx = self.list_selector.view().indexAt(event.position().toPoint())
+            if idx.isValid():
+                data = self.list_selector.itemData(idx.row())
+                if isinstance(data, int):      # a real custom list (not a bucket/separator)
+                    self.list_selector.hidePopup()
+                    self._rename_list(data)
+                    return True                # consume the double-click
+        return super().eventFilter(obj, event)
+
+    def _rename_list(self, list_id: int) -> None:
+        """Prompt for and apply a new name for a custom list."""
+        old = next((nm for lid, nm in get_lists() if lid == list_id), "")
+        new, ok = QInputDialog.getText(self, "Rename list", "New name:", text=old)
+        if not ok:
+            return
+        new = new.strip()
+        if not new or new == old:
+            return
+        if not rename_list(list_id, new):
+            QMessageBox.warning(self, "Rename list",
+                                f"Couldn't rename — a list named “{new}” already exists.")
+            return
+        self._refresh_list_selector()          # relabels; keeps this list selected
+        idx = self.list_selector.findData(list_id)
+        if idx >= 0:
+            self.list_selector.setCurrentIndex(idx)
         self._build_reminders()
 
     # --- pop the reminders pane out into its own window --------------------
@@ -1364,7 +1929,9 @@ class AffinityView(QWidget):
                        if _in_raised_bucket(c, lo, hi)]
             status = f"{len(entries)} companies" if entries else "No companies in this range."
         else:                                     # custom watchlist (int id)
-            by_id = {c.id: c for c in self._companies}
+            # Include Passed deals so passed companies in a list resolve to real Company objects
+            # (with a list_entry_id) — this lets Update Status act on them too.
+            by_id = {c.id: c for c in self._companies + self._passed}
             entries = []
             for cid, name in get_members(sel):
                 c = by_id.get(cid)
@@ -1431,29 +1998,6 @@ class AffinityView(QWidget):
             self._logo_cache[domain] = icon
             return icon
         return self._blank_icon              # no disk file → _start_logo_fetch will network-fetch
-
-    async def _index_noted_missed(self) -> None:
-        """Check untouched (Missed) companies for notes → _noted_ids.
-
-        Incremental: companies already known to have notes are kept without re-checking;
-        only untouched companies whose note-status we don't yet know are queried. New notes
-        on not-yet-noted companies are still picked up on every refresh (they get re-checked);
-        the only thing skipped is re-confirming companies already flagged as noted."""
-        untouched_ids = {c.id for c in self._companies if not c.emailed and not c.met}
-        known = self._noted_ids & untouched_ids          # already noted + still untouched → keep
-        to_check = [c for c in self._companies
-                    if c.id in untouched_ids and c.id not in known]
-        sem = asyncio.Semaphore(10)            # bound concurrency to be kind to the API
-
-        async def check(c: Company) -> int | None:
-            async with sem:
-                try:
-                    return c.id if await company_has_notes(c.id) else None
-                except Exception:
-                    return None
-
-        results = await asyncio.gather(*(check(c) for c in to_check))
-        self._noted_ids = known | {cid for cid in results if cid is not None}
 
     def select_company(self, c: Company) -> None:
         self._current = c
@@ -1821,18 +2365,34 @@ class AffinityView(QWidget):
         self.reader.clear()
         self.notes_status.setText("Loading notes…")
         local = get_local_notes(c.id)            # cheap, no network — always available
-        affinity, err = [], None
+        notes_key = f"{CACHE_AFFINITY_NOTES_PREFIX}{c.id}"
+        affinity, err, from_cache = [], None, False
         try:
             affinity = await get_company_notes(c.id)
+            write_cache(notes_key, notes_to_json(affinity))   # cache the fresh copy for later
         except Exception as e:
             err = e
+            # Rate-limited / offline: fall back to the last cached Affinity notes so they still
+            # show (local notes always show regardless of the API being down).
+            cached, _ = read_cache(notes_key)
+            if cached:
+                try:
+                    affinity = notes_from_json(cached)
+                    from_cache = bool(affinity)
+                except Exception:
+                    affinity = []
         self._notes = sorted(affinity + local, key=lambda n: n.created_at or "", reverse=True)
         for n in self._notes:
             label = "Local note" if n.local else ("Meeting note" if n.is_meeting else "Note")
             self.notes_list.addItem(f"{_date(n.created_at)}  ·  {label}  —  {_plain(n.content)[:70]}")
         if self._notes:
-            self.notes_status.setText(f"{len(self._notes)} notes — click one to read it"
-                                      + ("  ·  (Affinity unavailable)" if err else ""))
+            if err and from_cache:
+                suffix = "  ·  (Affinity unavailable — showing cached notes)"
+            elif err:
+                suffix = "  ·  (Affinity unavailable)"
+            else:
+                suffix = ""
+            self.notes_status.setText(f"{len(self._notes)} notes — click one to read it" + suffix)
         elif err:
             self.notes_status.setText(_friendly(err))
         else:
@@ -1930,7 +2490,7 @@ class AffinityView(QWidget):
 
     def reload_prefs(self) -> None:
         """Re-read the reminders order from settings (called after the Settings dialog closes)."""
-        self.reminders_order.setCurrentText(get_setting("pref.reminders_order", "Newest First"))
+        self.reminders_order.setCurrentText(get_setting("pref.reminders_order", "Newest Added"))
 
     def _save_layout(self) -> None:
         """Persist each splitter's proportions so the layout survives across launches."""
