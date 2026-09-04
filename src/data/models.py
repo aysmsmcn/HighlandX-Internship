@@ -24,11 +24,14 @@ class CacheEntry(Base):
 
 
 class CompanyList(Base):
-    """A user-created watchlist of companies (surfaced in the Reminders pane)."""
+    """A user-created watchlist of companies (surfaced in the Reminders pane), owned by an
+    Affinity person. Names are unique per owner, so two owners can each have a "Hot leads"."""
     __tablename__ = "company_list"
+    __table_args__ = (UniqueConstraint("owner_id", "name", name="uq_owner_list_name"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    name: Mapped[str] = mapped_column(unique=True)
+    owner_id: Mapped[int | None] = mapped_column(default=None)   # Affinity person id; None = unassigned
+    name: Mapped[str]
 
 
 class ListMember(Base):

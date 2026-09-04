@@ -11,7 +11,7 @@ from config import LOGOS_DIR
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QListWidget,
                                QListWidgetItem, QLabel, QSplitter, QTextBrowser, QLineEdit,
                                QComboBox, QApplication, QInputDialog, QMenu, QMessageBox,
-                               QFileDialog, QSpinBox, QDialog, QPlainTextEdit, QProgressDialog)
+                               QFileDialog, QSpinBox, QDialog, QPlainTextEdit)
 from PySide6.QtCore import Qt, QUrl, QByteArray, QSize, QEvent
 from PySide6.QtGui import (QShortcut, QKeySequence, QIcon, QPixmap, QColor, QPalette,
                            QFont)
@@ -35,8 +35,9 @@ from ui.company_row_delegate import CompanyRowDelegate, GradientPanel, set_gradi
 from services.outlook_service import get_calendar_events, get_message_by_interaction
 from services.settings_service import get_setting, set_setting
 from services.cache_service import read_cache, write_cache
-from services.lists_service import (get_lists, create_list, get_members, add_company,
-                                    remove_company, delete_list, rename_list)
+from services.lists_service import (get_lists, get_list, create_list, get_members, add_company,
+                                    remove_company, delete_list, rename_list, reassign_list,
+                                    assign_unowned_to)
 from services.local_notes_service import add_local_note, get_local_notes, delete_local_note
 from services import raylu_service
 
@@ -383,6 +384,14 @@ class NoCompanyColumnError(Exception):
     """Raised when an imported file has no company-name / company-domain column header."""
 
 
+def _int_or_none(s: str | None) -> int | None:
+    """Parse a stored setting into an int, or None if empty/invalid."""
+    try:
+        return int(s) if s else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _friendly(err: Exception) -> str:
     """Turn a raw exception into a short, plain-language message."""
     if isinstance(err, AffinityQuotaExhausted):
@@ -429,6 +438,11 @@ class AffinityView(QWidget):
         super().__init__()
         self._companies: list[Company] = []      # full loaded set (active statuses)
         self._passed: list[Company] = []          # the owner's Passed deals (separate "Passed" filter)
+        # Owner scoping for custom lists: the connected user (from whoami, persisted) and the owner
+        # whose lists are currently shown (follows the loaded owner; persisted for startup).
+        self._connected_owner_id = _int_or_none(get_setting("pref.connected_owner_id"))
+        self._current_owner_id = (_int_or_none(get_setting("pref.current_list_owner_id"))
+                                  or self._connected_owner_id)
         self._current: Company | None = None
         self._web_source: str | None = None      # last web panel source (for auto-refresh)
         self._notes: list[Note] = []
@@ -813,13 +827,21 @@ class AffinityView(QWidget):
         owner_name = self.owner_selector.currentText()
         self.status.setText(f"Refreshing {owner_name}'s deals from Affinity…")
         try:
-            # Selected owner's person id, or None ("My deals") → the connected user (whoami).
-            pid = self.owner_selector.currentData()
-            if pid is None:
-                pid = await my_owner_id()
+            # The connected user (whoami — cheap, quota-exempt). Used to resolve "My deals" and to
+            # own any pre-existing unassigned lists (a one-time migration).
+            connected = await my_owner_id()
+            if connected != self._connected_owner_id:
+                self._connected_owner_id = connected
+                set_setting("pref.connected_owner_id", str(connected))
+                assign_unowned_to(connected)     # hand legacy lists to the connected user
+            # Selected owner's person id, or the connected user for "My deals".
+            pid = self.owner_selector.currentData() or connected
             self._companies = await list_my_companies(pid)
             self._loaded_pid = pid          # for the background Passed fetch
             self._passed = []               # clear the previous owner's Passed set until reloaded
+            # Custom lists follow the loaded owner (persist for startup).
+            self._current_owner_id = pid
+            set_setting("pref.current_list_owner_id", str(pid))
         except Exception as err:
             self.status.setText(_friendly(err))
             QApplication.restoreOverrideCursor()
@@ -830,6 +852,7 @@ class AffinityView(QWidget):
         # notes-index and Outlook events. Those finish in the background and update their
         # own panes when ready, so the company list is usable in seconds.
         updated = write_cache(CACHE_COMPANIES, companies_to_json(self._companies))
+        self._refresh_list_selector()           # show the loaded owner's custom lists
         self.apply_filter()                     # partitions + builds reminders + sets status
         self.status.setText(
             self.status.text() + f"  ·  updated {self._ago(updated)} — loading events…")
@@ -1079,6 +1102,17 @@ class AffinityView(QWidget):
         status_id, status_text = picked
         is_pass = status_id == PASSED_OPTION_ID
 
+        # Skip companies already at the target status — no write needed, saves one API call each.
+        target = status_text.strip().lower()
+        already = [c for c in companies if (c.status or "").strip().lower() == target]
+        companies = [c for c in companies if (c.status or "").strip().lower() != target]
+        if not companies:
+            QMessageBox.information(
+                self, "Update Status",
+                f"All {len(already)} companies are already set to “{status_text}”. "
+                "Nothing to update.")
+            return
+
         # Shared failsafes for ANY status change: never touch Portfolio companies, and flag
         # recently-contacted / recently-met ones for review (protected by default).
         result = self._safeguard_review(companies, skipped, list_name, status_text, is_pass)
@@ -1091,7 +1125,8 @@ class AffinityView(QWidget):
             reason = await self._pick_pass_reason()
             if reason is None:
                 return                             # cancelled at the reason step
-        await self._apply_status_updates(to_change, status_id, status_text, reason, kept=kept)
+        await self._apply_status_updates(to_change, status_id, status_text, reason,
+                                         kept=kept, already_same=len(already))
 
     async def _pick_status(self, count: int, list_name: str) -> "tuple[int, str] | None":
         """Load the Affinity Status options and let the user pick a target status for the batch.
@@ -1170,33 +1205,26 @@ class AffinityView(QWidget):
         kept = len(portfolio) + (len(recent) - (len(to_change) - len(safe)))
         return to_change, kept
 
-    async def _apply_status_updates(self, companies, status_id, status_text, reason, kept=0) -> None:
-        """Write the chosen status (and optional pass reason) to each company, concurrently,
-        showing a live progress dialog (with Cancel) and a final result summary."""
+    async def _apply_status_updates(self, companies, status_id, status_text, reason,
+                                    kept=0, already_same=0) -> None:
+        """Write the chosen status (and optional pass reason) to each company, concurrently.
+
+        Progress is shown by updating the status LABEL — deliberately NOT a modal QProgressDialog:
+        a modal dialog's setValue() calls QApplication.processEvents(), which re-enters the qasync
+        event loop while these tasks are running and raises "Cannot enter into task…". A plain
+        label update just schedules a repaint (handled between awaits), so it never re-enters.
+        """
         total = len(companies)
         self.update_status_btn.setEnabled(False)
-
-        progress = QProgressDialog(
-            f"Updating {total} companies to “{status_text}” in Affinity…\n"
-            "(0 done)", "Cancel", 0, total, self)
-        progress.setWindowTitle("Update Status")
-        progress.setWindowModality(Qt.WindowModality.WindowModal)
-        progress.setMinimumDuration(0)             # show immediately
-        progress.setAutoClose(True)
-        progress.setAutoReset(False)
-        progress.setValue(0)
+        self.status.setText(f"Updating {total} companies to “{status_text}” in Affinity… (0/{total})")
 
         sem = asyncio.Semaphore(8)
-        done_count = failed = succeeded = 0
+        done = succeeded = failed = 0
         first_error: Exception | None = None
 
         async def _one(c: Company) -> None:
-            nonlocal done_count, failed, succeeded, first_error
-            if progress.wasCanceled():
-                return
+            nonlocal done, succeeded, failed, first_error
             async with sem:
-                if progress.wasCanceled():
-                    return
                 try:
                     await set_status(c.list_entry_id, status_id, reason=reason or None)
                     succeeded += 1
@@ -1205,30 +1233,25 @@ class AffinityView(QWidget):
                     if first_error is None:
                         first_error = e
                 finally:
-                    done_count += 1
-                    progress.setLabelText(
-                        f"Updating {total} companies to “{status_text}” in Affinity…\n"
-                        f"({done_count} done · {succeeded} ok"
-                        + (f" · {failed} failed" if failed else "") + ")")
-                    progress.setValue(done_count)
+                    done += 1
+                    self.status.setText(          # safe label-only update (no processEvents)
+                        f"Updating to “{status_text}”… {done}/{total} "
+                        f"({succeeded} ok" + (f", {failed} failed" if failed else "") + ")")
 
         await asyncio.gather(*(_one(c) for c in companies))
-        progress.setValue(total)                   # ensure it closes
-        cancelled = progress.wasCanceled()
 
         reason_note = f" · reason: {reason['text']}" if reason and reason.get("text") else ""
-        headline = (f"Cancelled — {succeeded} of {total} updated to “{status_text}”"
-                    if cancelled else f"Set {succeeded} companies to “{status_text}”")
         self.status.setText(
-            headline
+            f"Set {succeeded} companies to “{status_text}”"
             + (f" · {failed} failed" if failed else "")
-            + (f" · {kept} kept" if kept else "") + reason_note + ".")
+            + (f" · {kept} kept" if kept else "")
+            + (f" · {already_same} already set" if already_same else "") + reason_note + ".")
         self.update_status_btn.setEnabled(True)
 
-        # Always show a final summary so the outcome (and any error) is never invisible.
+        # Final summary (shown after all tasks finish — no concurrent tasks, so a modal box is fine).
         summary = f"{succeeded} of {total} companies updated to “{status_text}”."
-        if cancelled:
-            summary = "Cancelled.\n\n" + summary
+        if already_same:
+            summary += f"\n{already_same} were already set to “{status_text}” — skipped (no API call)."
         if failed and first_error is not None:
             summary += f"\n\n{failed} failed. First error: {_friendly(first_error)}"
         QMessageBox.information(self, "Update Status", summary)
@@ -1393,7 +1416,7 @@ class AffinityView(QWidget):
         for key, label, _lo, _hi in RAISED_BUCKETS:
             self.list_selector.addItem(label, key)
         self.list_selector.addItem("Founding Date", FOUNDING_KEY)
-        lists = get_lists()
+        lists = get_lists(self._current_owner_id)     # only the current owner's custom lists
         if lists:
             self.list_selector.insertSeparator(self.list_selector.count())
             for lid, name in lists:
@@ -1407,7 +1430,7 @@ class AffinityView(QWidget):
         name, ok = QInputDialog.getText(self, "New list", "List name:")
         if not ok or not name.strip():
             return
-        lid = create_list(name.strip())
+        lid = create_list(name.strip(), self._current_owner_id)   # belongs to the current owner
         self._refresh_list_selector()
         idx = self.list_selector.findData(lid)
         if idx >= 0:
@@ -1521,7 +1544,7 @@ class AffinityView(QWidget):
         """Ask whether to ADD the matched companies to a list or REMOVE them from one, then pick
         the target list. Returns (operation, list_id, list_name, is_new) — operation is "add" or
         "remove" — or None if cancelled. Remove is only offered when a list already exists."""
-        existing = get_lists()
+        existing = get_lists(self._current_owner_id)
         if existing:
             box = QMessageBox(self)
             box.setWindowTitle("Import list")
@@ -1545,7 +1568,7 @@ class AffinityView(QWidget):
 
     def _pick_existing_list(self, prompt: str) -> "tuple[int, str] | None":
         """Pick one of the user's existing lists by name. Returns (list_id, name) or None."""
-        existing = get_lists()
+        existing = get_lists(self._current_owner_id)
         if not existing:
             QMessageBox.information(self, "Import list", "You have no lists yet.")
             return None
@@ -1603,7 +1626,7 @@ class AffinityView(QWidget):
     def _choose_import_destination(self) -> "tuple[int, str, bool] | None":
         """Ask whether to import into a NEW list or an EXISTING one. Returns
         (list_id, list_name, is_new), or None if the user cancels."""
-        existing = get_lists()                         # [(id, name)], ordered by name
+        existing = get_lists(self._current_owner_id)                         # [(id, name)], ordered by name
         make_new = True
         if existing:
             box = QMessageBox(self)
@@ -1623,7 +1646,7 @@ class AffinityView(QWidget):
             name, ok = QInputDialog.getText(self, "Import list", "Name for the new list:")
             if not ok or not name.strip():
                 return None
-            return create_list(name.strip()), name.strip(), True
+            return create_list(name.strip(), self._current_owner_id), name.strip(), True
 
         names = [nm for _, nm in existing]
         name, ok = QInputDialog.getItem(
@@ -1770,7 +1793,7 @@ class AffinityView(QWidget):
     def _populate_add_to_list_menu(self) -> None:
         """Rebuild the 'Add to list' menu from current lists (just before it opens)."""
         self.add_to_list_menu.clear()
-        for lid, name in get_lists():
+        for lid, name in get_lists(self._current_owner_id):
             act = self.add_to_list_menu.addAction(name)
             act.triggered.connect(
                 lambda checked=False, lid=lid, name=name: self._add_current_to_list(lid, name))
@@ -1789,7 +1812,7 @@ class AffinityView(QWidget):
         name, ok = QInputDialog.getText(self, "New list", "List name:")
         if not ok or not name.strip():
             return
-        lid = create_list(name.strip())
+        lid = create_list(name.strip(), self._current_owner_id)
         self._refresh_list_selector()          # so the reminders dropdown shows it
         self._add_current_to_list(lid, name.strip())
 
@@ -1807,12 +1830,13 @@ class AffinityView(QWidget):
         self._build_reminders()
 
     def _list_selector_context_menu(self, pos) -> None:
-        """Right-click the list dropdown to rename the selected custom list."""
+        """Right-click the list dropdown to rename or reassign the selected custom list."""
         list_id = self.list_selector.currentData()
-        if not isinstance(list_id, int):       # live buckets aren't real lists — can't rename
+        if not isinstance(list_id, int):       # live buckets aren't real lists — can't edit
             return
         menu = QMenu(self)
         menu.addAction("Rename list…").triggered.connect(lambda: self._rename_list(list_id))
+        menu.addAction("Assign to owner…").triggered.connect(lambda: self._reassign_list(list_id))
         menu.exec(self.list_selector.mapToGlobal(pos))
 
     def eventFilter(self, obj, event):
@@ -1830,7 +1854,8 @@ class AffinityView(QWidget):
 
     def _rename_list(self, list_id: int) -> None:
         """Prompt for and apply a new name for a custom list."""
-        old = next((nm for lid, nm in get_lists() if lid == list_id), "")
+        info = get_list(list_id)
+        old = info[2] if info else ""
         new, ok = QInputDialog.getText(self, "Rename list", "New name:", text=old)
         if not ok:
             return
@@ -1839,13 +1864,72 @@ class AffinityView(QWidget):
             return
         if not rename_list(list_id, new):
             QMessageBox.warning(self, "Rename list",
-                                f"Couldn't rename — a list named “{new}” already exists.")
+                                f"Couldn't rename — this owner already has a list named “{new}”.")
             return
         self._refresh_list_selector()          # relabels; keeps this list selected
         idx = self.list_selector.findData(list_id)
         if idx >= 0:
             self.list_selector.setCurrentIndex(idx)
         self._build_reminders()
+
+    def _owner_options(self) -> list[tuple[int, str]]:
+        """(owner_id, name) pairs to assign lists to — the discovered owners in the owner
+        dropdown, plus the connected user (from the 'My deals' entry). Deduped by id."""
+        options: list[tuple[int, str]] = []
+        seen: set[int] = set()
+        for i in range(self.owner_selector.count()):
+            oid = self.owner_selector.itemData(i)
+            name = self.owner_selector.itemText(i)
+            if oid is None:                    # "My deals (default)" → the connected user
+                oid = self._connected_owner_id
+                name = f"Me ({name})"
+            if oid is not None and oid not in seen:
+                seen.add(oid)
+                options.append((oid, name))
+        return options
+
+    def _pick_owner(self, default_id: "int | None", prompt: str) -> "int | None":
+        """Let the user pick an owner to assign a list to. Returns the owner id, or None if
+        cancelled / no owners are available."""
+        options = self._owner_options()
+        if not options:
+            QMessageBox.information(
+                self, "Assign to owner",
+                "No owners available yet — run “Find owners” to load them.")
+            return None
+        names = [nm for _, nm in options]
+        default_row = next((i for i, (oid, _) in enumerate(options) if oid == default_id), 0)
+        choice, ok = QInputDialog.getItem(self, "Assign to owner", prompt, names, default_row, False)
+        if not ok:
+            return None
+        return next(oid for oid, nm in options if nm == choice)
+
+    def _reassign_list(self, list_id: int) -> None:
+        """Move a custom list to a different Affinity owner, prompting for a rename if that owner
+        already has a list with the same name (per the requested behaviour)."""
+        info = get_list(list_id)
+        if info is None:
+            return
+        _id, cur_owner, name = info
+        new_owner = self._pick_owner(cur_owner, f"Assign “{name}” to which owner?")
+        if new_owner is None or new_owner == cur_owner:
+            return
+
+        new_name = None
+        while not reassign_list(list_id, new_owner, new_name):
+            # Name clash in the target owner — require a different name (or cancel).
+            new_name, ok = QInputDialog.getText(
+                self, "Assign to owner",
+                f"That owner already has a list named “{new_name or name}”.\nNew name for it:",
+                text=(new_name or name))
+            if not ok or not new_name.strip():
+                return                         # cancelled the reassignment
+            new_name = new_name.strip()
+
+        self._refresh_list_selector()          # the list leaves this owner's view
+        self._build_reminders()
+        QMessageBox.information(self, "Assign to owner",
+                                f"“{new_name or name}” moved to the selected owner.")
 
     # --- pop the reminders pane out into its own window --------------------
 
