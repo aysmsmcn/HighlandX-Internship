@@ -231,7 +231,9 @@ These need resolving as their phase approaches:
 - [x] Phase 3 — Outlook data
 - [x] Phase 4 — External data (Affinity API; pivoted from web scraping to a company-centric view: 3-category browser, calendar Events, per-company relationship summary/timeline/notes, website + Affinity links)
 - [x] Phase 5 — Integration & polish (error handling, loading states, settings, UX polish, SQLite caching)
-- [ ] Phase 6 — Packaging
+- [x] Phase 6 — Packaging (PyInstaller one-dir build via `highlandx.spec`; windowed `console=False`
+      exe in `dist/HighlandX/`, distributed as a dated zip. Build: `python -m PyInstaller
+      highlandx.spec --noconfirm`)
 
 _Update the checkboxes as you complete each phase so Claude Code can see where
 things stand._

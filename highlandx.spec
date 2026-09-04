@@ -18,6 +18,10 @@ for pkg in (
     "msgraph", "msgraph_core",
     "kiota_abstractions", "kiota_http",
     "kiota_serialization_json", "kiota_authentication_azure",
+    # Raylu enrichment (lazy imports inside raylu_service) + the .xlsx importer. These are
+    # imported inside functions and/or load submodules dynamically, so static analysis misses
+    # them; pydantic(_core) backs the MCP + Anthropic SDKs.
+    "openpyxl", "anthropic", "mcp", "pydantic", "pydantic_core",
 ):
     try:
         d, b, h = collect_all(pkg)
@@ -53,7 +57,7 @@ exe = EXE(
     debug=False,
     strip=False,
     upx=False,               # UPX + Qt DLLs can corrupt; keep off
-    console=True,            # TEMP: shows import errors; flip to False once clean
+    console=False,           # windowed app — no console window for end users
 )
 
 coll = COLLECT(
